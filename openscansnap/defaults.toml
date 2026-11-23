@@ -1,0 +1,38 @@
+# open-scansnap settings and their defaults.
+# Put the ones you want to change in ~/.config/open-scansnap/config.toml.
+
+# Folder for the PDFs.
+out_dir = "~/Downloads"
+
+# Debug mode: keep every scan's raw sides (as the scanner sent them, before
+# cropping) in ~/Library/Logs/open-scansnap/raw, and log in detail.
+debug = false
+
+[scan]
+# How pages are stored: "auto" (black and white, gray or color, whichever
+# suits each page), "black-and-white", "gray", "color", "photo" (color, with
+# remove_blank, remove_show_through and clean_up off) or "as-scanned" (the
+# scanner's image, uncropped and unturned).
+mode = "auto"
+# "draft", "standard" or "high": color and gray pages at 150, 200 or 300 dpi,
+# black and white at twice that.
+quality = "high"
+# Straighten each sheet and crop it to its edges.
+straighten = true
+# Turn pages so their text reads upright.
+upright = true
+# Leave out blank sides.
+remove_blank = true
+# Paint out the other side's print where it shows through the paper.
+remove_show_through = true
+# Clear creases, shadows and marks at the paper edge.
+clean_up = true
+# Add a text layer so the PDF can be searched.
+searchable = true
+# Tesseract language(s) for the text layer, e.g. "eng+nld". Each needs its
+# Tesseract data (brew install tesseract-lang).
+language = "eng"
+
+[window]
+# Show the scan window when paper is put in the feeder.
+show_when_paper_loaded = true

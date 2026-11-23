@@ -1,0 +1,12 @@
+img2pdf
+numpy
+ocrmypdf
+pikepdf
+pillow
+scikit-image
+pyobjc-framework-Cocoa; sys_platform == "darwin"
+tomli-w
+pypdfium2
+pyobjc-framework-ServiceManagement; sys_platform == "darwin"
+scipy
+psutil

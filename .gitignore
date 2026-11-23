@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+# SANE source (its own git repository, branch vens) and its build
+sane-backends/
+sane-prefix/
+build/
+dist/
+
+# Private sample scans for the regression test (tests/test_samples.py)
+samples/
