@@ -25,22 +25,33 @@ Home.
 
 ## Install
 
-Only one app can hold the scanner, so remove ScanSnap Home first. Besides
-dragging it to the Trash, run the uninstaller it leaves behind:
-**Applications ▸ ScanSnap Online Update ▸ Sub ▸ AOUUninstaller**.
+Only one app can use the scanner at a time, and ScanSnap Home holds on to it
+whenever it runs. Try Open ScanSnap first; remove ScanSnap Home once you're
+happy:
 
-Then download the [latest release](https://github.com/thomergil/open-scansnap/releases/latest),
-or:
+1. **Quit ScanSnap Home**, the window *and* its icon in the menu bar
+   (click it, then Quit). It starts again at login: after a restart, quit it
+   again until you've removed it.
+2. **Install Open ScanSnap**: download the
+   [latest release](https://github.com/thomergil/open-scansnap/releases/latest),
+   or:
 
-```sh
-brew tap thomergil/tap
-brew trust --cask thomergil/tap/open-scansnap   # Homebrew asks before loading a cask from a tap
-brew install --cask thomergil/tap/open-scansnap
-```
+   ```sh
+   brew tap thomergil/tap
+   brew trust --cask thomergil/tap/open-scansnap   # Homebrew asks before loading a cask from a tap
+   brew install --cask thomergil/tap/open-scansnap
+   ```
 
-Needs Apple silicon and macOS 13 or later. A scanner already on your Wi-Fi
-network is found by itself; a new one can be put on it from **Set up
-Wi-Fi…** while plugged in over USB.
+   A scanner already on your Wi-Fi network is found by itself; a new one can
+   be put on it from **Set up Wi-Fi…** while plugged in over USB.
+3. **Scan** a few batches and check the results.
+4. **Remove ScanSnap Home** once you're happy, so it no longer starts at
+   login and takes the scanner: drag it from Applications to the Trash, then
+   run the uninstaller it leaves behind, **Applications ▸ ScanSnap Online
+   Update ▸ Sub ▸ AOUUninstaller**. For a firmware update later, download it
+   again from PFU.
+
+Needs Apple silicon and macOS 13 or later.
 
 <p><img src="docs/images/menu-scan-mode.png" width="460" alt="The Scan mode menu"></p>
 
@@ -64,6 +75,9 @@ protocol is known.
 (the model, Wi-Fi or USB, and what happened), so this list can say.
 
 ## FAQ
+
+**The menu says the scanner is in use by another app.**
+ScanSnap Home is running: quit it, including its icon in the menu bar.
 
 **A page came out wrong, or one I need was left out.**
 **Review last scan…**, pick **Store as** for the page, **Update PDF**. The
