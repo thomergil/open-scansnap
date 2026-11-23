@@ -12,91 +12,65 @@ Home.
 
 ## Features
 
-- Lives in the menu bar; press the scanner's Scan button, or choose Scan.
-- Makes one searchable PDF per batch, in your Downloads folder (or a folder
-  you choose).
-- Straightens and crops each page, turns it upright, and leaves out blank
-  pages.
-- Stores text pages in black and white, and keeps color where there is color.
-- Removes the other side's print showing through the paper, and the shadows
-  of folds.
-- Shows each scan's pages after scanning, so you can store any of them
-  another way (in black and white, gray, color or as a photo, or not at all)
-  and update the PDF.
-- Recognizes each page's language, so its text can be searched.
-- Works over Wi-Fi or with the USB cable, and sets up the scanner's Wi-Fi.
-- Updates itself.
+- One searchable PDF per batch, made in the background while the next
+  sheets scan.
+- Straightened, cropped and turned upright; blank sides left out; text pages
+  in black and white, color kept where there is color.
+- The other side's print showing through the paper, and fold shadows,
+  removed.
+- Each page's language recognized, in 36 bundled languages.
+- After a scan, any page can be stored another way (black and white, gray,
+  color, photo, or left out) and the PDF updated in place.
+- Wi-Fi or USB; sets up the scanner's Wi-Fi over USB.
 
 ## Install
 
-1. Make sure ScanSnap Home is not running: only one app can use the
-   scanner. To remove it for good, as PFU describes for macOS:
-   1. Quit ScanSnap Home, including its menu bar item.
-   2. In Finder, open **Applications**, drag **ScanSnap Home** to the Trash,
-      and empty the Trash.
-   3. Then remove ScanSnap Online Update, which came with it: open
-      **Applications ▸ ScanSnap Online Update ▸ Sub**, double-click
-      **AOUUninstaller**, click **Continue**, then **Uninstall**, and type
-      your password.
-2. Download the newest `OpenScanSnap-*.dmg` from
-   [Releases](https://github.com/thomergil/open-scansnap/releases).
-3. Drag Open ScanSnap to Applications and open it.
+Only one app can hold the scanner, so remove ScanSnap Home first. Besides
+dragging it to the Trash, run the uninstaller it leaves behind:
+**Applications ▸ ScanSnap Online Update ▸ Sub ▸ AOUUninstaller**.
 
-Open ScanSnap needs a Mac with Apple silicon and macOS 13 or later.
+Then download the [latest release](https://github.com/thomergil/open-scansnap/releases/latest),
+or:
 
-## First use
+```sh
+brew tap thomergil/tap
+brew trust --cask thomergil/tap/open-scansnap   # Homebrew asks before loading a cask from a tap
+brew install --cask thomergil/tap/open-scansnap
+```
 
-- **On Wi-Fi:** if the scanner is already on your Wi-Fi network (set up by
-  ScanSnap Home or with its WPS button), Open ScanSnap finds it by itself.
-- **On USB:** plug the scanner in. To put it on your Wi-Fi network, choose
-  **Set up Wi-Fi…** in the menu, pick the network, and type its password.
-
-Put paper in the feeder and press the scanner's Scan button.
+Needs Apple silicon and macOS 13 or later. A scanner already on your Wi-Fi
+network is found by itself; a new one can be put on it from **Set up
+Wi-Fi…** while plugged in over USB.
 
 <p><img src="docs/images/menu-scan-mode.png" width="460" alt="The Scan mode menu"></p>
 
 ## FAQ
 
-**A page came out wrong, or a page I need was left out.**
-Choose **Review last scan…** in the menu, select the page (Shift-click or
-⌘-click to select several), choose how to store it in **Store as** (the
-preview shows the page stored that way), and click **Update PDF**.
-The review window opens after each scan while **Show review after each scan**
-is on in the menu; its checkbox **Open this window after each scan** turns
-the same setting on or off.
+**A page came out wrong, or one I need was left out.**
+**Review last scan…**, pick **Store as** for the page, **Update PDF**. The
+review window can open after every scan (**Show review after each scan**).
 
-**Where is the last scan kept, and for how long?**
-To let you review it, Open ScanSnap keeps your latest scan as the scanner
-sent it (about 7 MB per side, blank sides included) in
-`~/Library/Application Support/open-scansnap/review`, readable only by you.
-The next scan replaces it. If you delete its PDF, Open ScanSnap removes it
-at the next scan or the next time it starts.
+**Where is the last scan kept?**
+In `~/Library/Application Support/open-scansnap/review`, readable only by
+you, as the scanner sent it (about 7 MB per side), until the next scan.
 
-**Characters or words are missing from my scan.**
-Turn off **Processing ▸ Remove show-through**, scan again, and please
-[report it](https://github.com/thomergil/open-scansnap/issues/new) with the
+**Characters or words are missing.**
+Turn off **Processing ▸ Remove show-through** and
+[report it](https://github.com/thomergil/open-scansnap/issues/new), with the
 scan if you can share it.
 
-**The text in my PDF is not searchable in my language.**
-Text language is Automatic unless you changed it: each page's language is
-recognized. If it is recognized wrongly, choose your language in
-**Processing ▸ Text language**.
-
 **The scanner is not found.**
-Turn it on (open its paper chute), check that it is on the same network as
-your Mac, and allow Open ScanSnap in **System Settings ▸ Privacy & Security
-▸ Local Network**.
+The iX500 turns on when its paper chute opens. Open ScanSnap also needs
+**System Settings ▸ Privacy & Security ▸ Local Network**.
 
-**The menu says the scanner is in use by another app.**
-Quit ScanSnap Home, including its menu bar item.
-
-**Can Open ScanSnap update the scanner's firmware?**
-No. Use ScanSnap Home for that (reinstall it from PFU's downloads, and quit
-it again afterwards); the menu shows a ⚠ when newer firmware exists.
-Choosing the scanner's line in the menu opens PFU's downloads.
+**Firmware updates?**
+Not from Open ScanSnap: a failed update can leave the scanner unusable. The
+menu shows ⚠ when newer firmware exists; update with ScanSnap Home.
 
 **Which scanners work?**
-The ScanSnap iX500. Others may work over USB but are untested.
+Wi-Fi: the iX500, the only one tested. USB: scanning goes through SANE,
+whose fujitsu backend also supports the S1500, iX100, iX1300, iX1500 and
+iX1600; untested with Open ScanSnap.
 
 ## For developers
 
