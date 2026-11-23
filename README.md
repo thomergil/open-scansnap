@@ -6,8 +6,8 @@ Scan from a ScanSnap iX500 on your Mac, over Wi-Fi or USB, without ScanSnap
 Home.
 
 <p>
-  <img src="docs/images/menu.png" width="250" alt="The menu">
-  <img src="docs/images/menu-processing.png" width="460" alt="The Processing menu">
+  <img src="docs/images/menu-scan-mode.png" width="400" alt="The menu, with its scan modes">
+  <img src="docs/images/menu-processing.png" width="400" alt="The Processing menu">
 </p>
 
 ## Features
@@ -52,8 +52,6 @@ happy:
    again from PFU.
 
 Needs Apple silicon and macOS 13 or later.
-
-<p><img src="docs/images/menu-scan-mode.png" width="460" alt="The Scan mode menu"></p>
 
 ## Supported scanners
 
