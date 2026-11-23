@@ -55,6 +55,29 @@ class ShowThroughTest(unittest.TestCase):
         )
         self.assertLess((cleaned < PAPER - 10).mean(), 0.0005)
 
+    def test_print_a_copy_touches_stays(self):
+        # a pen drawing's copy runs into this side's own letters: one mark,
+        # mostly the faint copy; the letters stay, the copy goes (a drawing
+        # behind a typed page lost a t and an i, 2026-11-23)
+        front = Image.new("RGB", LETTER, (PAPER,) * 3)
+        ImageDraw.Draw(front).ellipse(
+            (600, 900, 1800, 2400), outline=(INK,) * 3, width=12
+        )
+        back = faint(front, 0.3)
+        draw = ImageDraw.Draw(back)
+        # letters, thin strokes crossing the copy's ring at its left
+        # (mirrored: the ring's left on the back is at x = 2550 - 1800)
+        for x in (735, 760):
+            draw.rectangle((x, 1600, x + 6, 1700), fill=(INK,) * 3)
+        cleaned = np.asarray(
+            showthrough.clean(back, front, DPI).convert("L"), dtype=np.float64
+        )
+        for x in (735, 760):
+            with self.subTest(letter=x):
+                self.assertLess(cleaned[1600:1700, x + 1 : x + 6].mean(), 40)
+        ring = np.s_[1000:1400, 900:1700]  # the copy, away from the letters
+        self.assertLess((cleaned[ring] < PAPER - 10).mean(), 0.0005)
+
     def test_own_print_stays_when_the_other_side_shows_only_it(self):
         # a printed front and a blank back: what the back has is the front
         # showing through, which must not take the front's own print away

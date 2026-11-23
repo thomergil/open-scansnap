@@ -1,7 +1,8 @@
 """Regression test on real scans: each folder of samples/ (not in git: the
 owner's own documents) holds a sheet's raw sides as the scanner sent them
 (page0001.tif, ...) and expected.toml, what became of each side when the
-result was checked by eye; every stored page's text must also be level. Run python tests/test_samples.py --record NAME
+result was checked by eye, and words a side must read ("reads"), added by
+hand; every stored page's text must also be level. Run python tests/test_samples.py --record NAME
 to write expected.toml for a sample from the current pipeline."""
 
 import shutil
@@ -52,7 +53,12 @@ def outcome(sample: Path) -> list[dict]:
             result.append({"mode": "blank"})
         else:
             result.append(
-                {"mode": str(page.mode), "words": words(page), "tilt": tilt(page)}
+                {
+                    "mode": str(page.mode),
+                    "words": words(page),
+                    "tilt": tilt(page),
+                    "text": text(page),
+                }
             )
     return result
 
@@ -64,11 +70,20 @@ def tilt(page: pages.Page) -> float:
     return 0.0 if found is None else float(np.degrees(found))
 
 
-def words(page: pages.Page) -> int:
-    """The words Tesseract reads on a stored page, whatever its mode."""
+def ink(page: pages.Page) -> np.ndarray:
+    """The ink of a stored page, whatever its mode."""
     gray = np.asarray(page.image.convert("L"))
-    ink = gray <= threshold_otsu(gray) if gray.min() < gray.max() else gray < 0
-    return round(pages.readable_words(ink, page.dpi, "eng"))
+    return gray <= threshold_otsu(gray) if gray.min() < gray.max() else gray < 0
+
+
+def words(page: pages.Page) -> int:
+    """The words Tesseract reads on a stored page."""
+    return round(pages.readable_words(ink(page), page.dpi, "eng"))
+
+
+def text(page: pages.Page) -> str:
+    """The text Tesseract reads on a stored page."""
+    return pages.read_text(ink(page), page.dpi, "eng")
 
 
 def samples() -> list[Path]:
@@ -95,6 +110,8 @@ class SamplesTest(unittest.TestCase):
                             LEVEL_DEGREES,
                             f"side {number}: its text is not level",
                         )
+                    for word in then.get("reads", []):  # letters lost show here
+                        self.assertIn(word, now["text"], f"side {number}")
                     if "words" in then:
                         self.assertGreaterEqual(
                             now["words"],
@@ -107,7 +124,7 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--record"]:
         for name in sys.argv[2:]:
             result = [  # level is required of every page, not recorded
-                {k: v for k, v in side.items() if k != "tilt"}
+                {k: v for k, v in side.items() if k not in ("tilt", "text")}
                 for side in outcome(SAMPLES / name)
             ]
             (SAMPLES / name / EXPECTED).write_text(

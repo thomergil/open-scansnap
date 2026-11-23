@@ -15,7 +15,16 @@ is the other side's print coming through when
 
 Both hold for faint show-through and for dark ink that soaked through (a
 marker). Such marks, with their soft edges, become paper. So does anything
-too faint here to be part of a mark, where the other side has ink. This is the idea of Sharma, "Show-through cancellation in
+too faint here to be part of a mark, where the other side has ink.
+
+A copy running into this side's own letters joins them into one mark. Its
+print stays: what is darker than any copy can be (more than COPY_DARKNESS
+of the other side's darkest ink, and darker than the other side's ink
+nearby: paper only takes darkness away), in spots at least a printed
+period's size, and what joins them and is still darker than a copy could
+be there, with its soft edge.
+
+This is the idea of Sharma, "Show-through cancellation in
 scans of duplex printed documents" (IEEE Transactions on Image Processing,
 2001).
 """
@@ -45,6 +54,15 @@ ALIGNMENT_MM = 2.0
 # A mark's soft edge: pixels joining it that are darker than the paper by
 # more than this many times its noise (2: outside 95% of the paper's tones)
 FRINGE_SIGMAS = 2.0
+# How far print's soft edge reaches past its dark core: scanners blur an edge
+# over a fraction of a millimeter (sheet.py); kept with print a copy touched
+PRINT_EDGE_MM = 0.25
+# The other side's darkest ink: this percentile of its ink's darkness, so a
+# few dust specks or noise do not set it
+DARKEST_INK = 99
+# A printed period, across: about 0.3 mm in 10-point type; print smaller
+# than its square is a speck
+PERIOD_MM = 0.3
 
 
 def clean(side: Image.Image, other: Image.Image, dpi: int) -> Image.Image:
@@ -98,10 +116,41 @@ def clean(side: Image.Image, other: Image.Image, dpi: int) -> Image.Image:
         dark_there = other_paper - ndimage.mean(aligned, marks * other_ink, numbers)
     coming_through = (on > size - on) & (dark_here <= COPY_DARKNESS * dark_there)
     coming_through[0] = False  # the background
+    copied = coming_through[marks]
+    # A copy touching print joins it into one mark, through its soft edge.
+    # Print in such a mark starts where no copy can be: darker than any copy
+    # of the other side (COPY_DARKNESS of its darkest ink), and darker than
+    # the other side's ink at that point (paper only takes darkness away;
+    # ink soaked through measured at most 1.05 of its original, within
+    # noise). Spots smaller than a printed period are specks, not print.
+    # From there print reaches on through what is darker than a copy could
+    # be at each point, and is kept with its own soft edge.
+    darkness = paper - here
+    other_darkness = other_paper - aligned
+    darkest_ink = float(np.percentile(other_darkness[other_ink], DARKEST_INK))
+    margin = sheet.NOISE_SIGMAS * noise
+    # darker than the other side's ink anywhere within an ink edge of the
+    # point (the two sides line up only to within their soft edges), beyond
+    # chance: outside 95% of what the two sides' noise alone gives
+    darker = FRINGE_SIGMAS * float(np.hypot(noise, other_noise))
+    edge = 2 * sheet.pixels(PRINT_EDGE_MM, dpi) + 1
+    nearby = ndimage.grey_dilation(other_darkness, size=(edge, edge))
+    no_copy = copied & (
+        (darkness > COPY_DARKNESS * darkest_ink + margin) & (darkness > nearby + darker)
+    )
+    spots, count = ndimage.label(no_copy, structure=pages.EIGHT_NEIGHBORS)
+    spot_size = ndimage.sum_labels(no_copy, spots, np.arange(count + 1))
+    period = sheet.pixels(PERIOD_MM, dpi) ** 2
+    printed = ndimage.binary_propagation(
+        (spot_size >= period)[spots] & no_copy,
+        mask=copied & (darkness > COPY_DARKNESS * other_darkness + margin),
+    )
+    kept = ndimage.binary_dilation(printed, iterations=sheet.pixels(PRINT_EDGE_MM, dpi))
     through = np.zeros(gray.shape, dtype=bool)
-    # the marks coming through, edges and all, and, where the other side has
-    # ink, what is too faint here to be part of a mark: the faintest copies
-    through[:height, :width] = coming_through[marks] | (
+    # the marks coming through, edges and all, but for print they touch; and,
+    # where the other side has ink, what is too faint here to be part of a
+    # mark: the faintest copies
+    through[:height, :width] = (copied & ~kept) | (
         other_ink & ~own_ink[:height, :width]
     )
     if not through.any():
