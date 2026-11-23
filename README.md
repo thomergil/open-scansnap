@@ -5,10 +5,7 @@
 Scan from a ScanSnap iX500 on your Mac, over Wi-Fi or USB, without ScanSnap
 Home.
 
-<p>
-  <img src="docs/images/menu-scan-mode.png" width="400" alt="The menu, with its scan modes">
-  <img src="docs/images/menu-processing.png" width="400" alt="The Processing menu">
-</p>
+<p><img src="docs/images/menu-processing.png" width="565" alt="The menu, with its Processing options"></p>
 
 ## Features
 
