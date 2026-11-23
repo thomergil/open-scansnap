@@ -44,6 +44,25 @@ Wi-Fi…** while plugged in over USB.
 
 <p><img src="docs/images/menu-scan-mode.png" width="460" alt="The Scan mode menu"></p>
 
+## Supported scanners
+
+| Scanner | Wi-Fi | USB |
+|---|---|---|
+| ScanSnap iX500 | ✅ confirmed | ✅ confirmed |
+| ScanSnap iX1600 | ❓ | ❓ |
+| ScanSnap iX1500 | ❓ | ❓ |
+| ScanSnap iX1300 | ❓ | ❓ |
+| ScanSnap iX100 | ❓ | ❓ |
+| ScanSnap S1500 | no Wi-Fi | ❓ |
+
+Over USB, Open ScanSnap scans through SANE, whose fujitsu backend supports
+all of these, so they are likely to work. Over Wi-Fi, only the iX500's
+protocol is known.
+
+**Tried one of the ❓ scanners, or another ScanSnap?** Please
+[tell me how it went](https://github.com/thomergil/open-scansnap/issues/new?title=Scanner%20report:%20)
+(the model, Wi-Fi or USB, and what happened), so this list can say.
+
 ## FAQ
 
 **A page came out wrong, or one I need was left out.**
@@ -66,11 +85,6 @@ The iX500 turns on when its paper chute opens. Open ScanSnap also needs
 **Firmware updates?**
 Not from Open ScanSnap: a failed update can leave the scanner unusable. The
 menu shows ⚠ when newer firmware exists; update with ScanSnap Home.
-
-**Which scanners work?**
-Wi-Fi: the iX500, the only one tested. USB: scanning goes through SANE,
-whose fujitsu backend also supports the S1500, iX100, iX1300, iX1500 and
-iX1600; untested with Open ScanSnap.
 
 ## For developers
 
