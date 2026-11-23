@@ -15,7 +15,9 @@ import os
 import socket
 import sys
 from collections.abc import Callable
+from enum import Enum, StrEnum, auto
 from pathlib import Path
+from typing import NamedTuple
 
 import objc
 from AppKit import (
@@ -55,6 +57,9 @@ from AppKit import (
     NSSecureTextField,
     NSStatusBar,
     NSStringDrawingUsesDeviceMetrics,
+    NSTerminateCancel,
+    NSTerminateLater,
+    NSTerminateNow,
     NSTextField,
     NSVariableStatusItemLength,
     NSWindowStyleMaskClosable,
@@ -98,6 +103,7 @@ from .options import (
     LANGUAGE_SEPARATOR,
     Quality,
     ScanMode,
+    ShowThrough,
     lineart_dpi,
     page_dpi,
 )
@@ -118,16 +124,41 @@ SHIMMER_STEP = 0.05  # seconds per frame
 SHIMMER_FRAMES = 24  # one sweep
 SHIMMER_WIDTH = 0.5  # of the band, as a share of the icon's width
 SHIMMER_DEPTH = 0.7  # how far the band's middle fades the icon
-OFF_ALPHA = 0.4  # the letter while the scanner is off or out of reach
-# How the scanner is connected: its SF Symbol, at a size in points that makes
-# the marks look alike in weight (the plug is drawn smaller in its box), and
-# what VoiceOver says
-VIA_SYMBOLS = {Via.WIFI: ("wifi", 7.0), Via.USB: ("cable.connector", 10.0)}
-VIA_DESCRIPTIONS = {
-    Via.WIFI: "scanner on Wi-Fi",
-    Via.USB: "scanner on USB",
+OFF_ALPHA = 0.4  # the letter's opacity while the scanner cannot be used
+
+
+class Mark(StrEnum):
+    """What the icon shows beside its letter: how the scanner is connected,
+    or that something needs the user."""
+
+    WIFI = "wifi"
+    USB = "usb"
+    ALERT = "alert"
+
+
+class Icon(NamedTuple):
+    """The menu bar icon: its letter dimmed unless the scanner can be used
+    (ON_STATES), and its mark, if any."""
+
+    on: bool
+    mark: Mark | None
+
+
+VIA_MARKS = {Via.WIFI: Mark.WIFI, Via.USB: Mark.USB}
+# Each mark's SF Symbol, at a size in points that makes the marks look alike
+# in weight (the plug is drawn smaller in its box), and what VoiceOver says
+MARK_SYMBOLS = {
+    Mark.WIFI: ("wifi", 7.0),
+    Mark.USB: ("cable.connector", 10.0),
+    Mark.ALERT: ("exclamationmark", 8.0),
+}
+MARK_DESCRIPTIONS = {
+    Mark.WIFI: "scanner on Wi-Fi",
+    Mark.USB: "scanner on USB",
+    Mark.ALERT: "needs your attention",
     None: "scanner off",
 }
+ICONS = tuple(Icon(on, mark) for on in (True, False) for mark in MARK_DESCRIPTIONS)
 PASSWORD_FIELD_WIDTH, PASSWORD_FIELD_HEIGHT = 220.0, 24.0  # points
 TESSERACT_VARIANT_SEPARATOR = "_"
 # Tesseract's kinds of one language (chi_sim), as the menu names them
@@ -137,6 +168,14 @@ TESSERACT_VARIANTS = {
 }  # chi_sim: Chinese, simplified script
 MARK_GAP = 1.0  # points between the letter and the mark
 ON_STATES = {State.READY, State.PAPER, State.SCANNING}
+# what keeps the scanner from use until the user acts (the menu says what)
+ERROR_STATES = {
+    State.NOT_SET_UP,
+    State.BAD_CONFIGURATION,
+    State.UNUSABLE,
+    State.BUSY,
+    State.REFUSED,
+}
 REFRESH_SECONDS = 0.25
 # Quit waits this long for the scanner to be released; a call to a scanner
 # that does not answer can take longer, and the scanner then drops the
@@ -241,12 +280,20 @@ QUALITY_TITLES = {
     Quality.STANDARD: "Standard",
     Quality.HIGH: "High",
 }
-# The processing steps a user can switch off: Options field, menu title
-STEP_TITLES = {
+SHOW_THROUGH_TITLES = {
+    ShowThrough.GRAY_AND_COLOR: "Remove on gray and color pages",
+    ShowThrough.EVERY_PAGE: "Remove on every page",
+    ShowThrough.KEEP: "Keep",
+}
+# The Processing menu's switches and submenus of fixed values, in order: each
+# an Options field, with its title, or its submenu's title and titles by
+# value; the Text language submenu, built from the installed languages,
+# follows them
+PROCESSING: dict[str, str | tuple[str, dict]] = {
     "straighten": "Straighten and crop to the sheet",
     "upright": "Turn pages upright",
     "remove_blank": "Remove blank pages",
-    "remove_show_through": "Remove show-through",
+    "show_through": ("Show-through", SHOW_THROUGH_TITLES),
     "clean_up": "Clean up creases and shadows",
     "searchable": "Make searchable",
 }
@@ -263,7 +310,7 @@ def describe(snapshot: Snapshot) -> tuple[str, str]:
             TEXT["ready_again"].format(processing=processing),
             snapshot.failure or TEXT[snapshot.state],
         )
-    usable = snapshot.state in (State.READY, State.PAPER, State.SCANNING)
+    usable = snapshot.state in ON_STATES
     if snapshot.failure and usable:  # else what to do about the scanner comes first
         detail = snapshot.failure
     elif snapshot.making:
@@ -303,12 +350,20 @@ def can_scan(snapshot: Snapshot) -> bool:
     return snapshot.state == State.PAPER
 
 
-def status_icon(via: Via | None) -> NSImage:
-    """ICON_LETTER in ICON_FONT, ICON_HEIGHT tall, as a template image: with
-    the symbol of how the scanner is connected (via) at its upper right,
-    dimmed while it is not (None). The image is the letter's own outline,
-    so macOS has nothing to shrink."""
-    on = via is not None
+class QuitState(Enum):
+    """The quit's progress: not begun, finishing the scan and PDFs in
+    progress, or done."""
+
+    RUNNING = auto()
+    FINISHING = auto()
+    DONE = auto()
+
+
+def status_icon(icon: Icon) -> NSImage:
+    """ICON_LETTER in ICON_FONT, ICON_HEIGHT tall, as a template image,
+    dimmed unless icon is on, with icon's mark at its upper right. The image
+    is the letter's own outline, so macOS has nothing to shrink."""
+    on, mark = icon
 
     def letter_at(points: float) -> NSAttributedString:
         font = NSFont.fontWithName_size_(
@@ -339,13 +394,13 @@ def status_icon(via: Via | None) -> NSImage:
                 points, NSFontWeightBold
             )
         )
-        for kind, (name, points) in VIA_SYMBOLS.items()
+        for kind, (name, points) in MARK_SYMBOLS.items()
     }
-    mark = NSMakeSize(
+    room = NSMakeSize(
         max(symbol.size().width for symbol in symbols.values()),
         max(symbol.size().height for symbol in symbols.values()),
     )
-    width = math.ceil(bounds.size.width + mark.width + MARK_GAP + 2 * ICON_MARGIN)
+    width = math.ceil(bounds.size.width + room.width + MARK_GAP + 2 * ICON_MARGIN)
     height = math.ceil(bounds.size.height + 2 * ICON_MARGIN)
 
     def draw(_rect) -> bool:
@@ -363,9 +418,9 @@ def status_icon(via: Via | None) -> NSImage:
             NSStringDrawingUsesDeviceMetrics,
             None,
         )
-        if on:
-            symbol = symbols[via].size()
-            symbols[via].drawInRect_(
+        if mark is not None:
+            symbol = symbols[mark].size()
+            symbols[mark].drawInRect_(
                 NSMakeRect(
                     ICON_MARGIN + bounds.size.width + MARK_GAP,
                     height - ICON_MARGIN - symbol.height,
@@ -379,7 +434,7 @@ def status_icon(via: Via | None) -> NSImage:
         NSMakeSize(width, height), False, draw
     )
     image.setTemplate_(True)
-    image.setAccessibilityDescription_(f"{APP_NAME}: {VIA_DESCRIPTIONS[via]}")
+    image.setAccessibilityDescription_(f"{APP_NAME}: {MARK_DESCRIPTIONS[mark]}")
     return image
 
 
@@ -408,10 +463,15 @@ def about_options() -> dict:
     }
 
 
-def connection(snapshot: Snapshot) -> Via | None:
-    """How the scanner is connected, for the icon; None while it is off or
-    out of reach."""
-    return snapshot.via if snapshot.state in ON_STATES else None
+def icon_of(snapshot: Snapshot) -> Icon:
+    """The icon for snapshot: on while the scanner can be used; marked
+    ALERT while something needs the user (an error state, or a PDF that
+    failed, until the next scan), else with how a usable scanner is
+    connected."""
+    on = snapshot.state in ON_STATES
+    if snapshot.state in ERROR_STATES or snapshot.failure:
+        return Icon(on, Mark.ALERT)
+    return Icon(on, VIA_MARKS.get(snapshot.via) if on else None)
 
 
 def open_at_login() -> str | None:
@@ -478,17 +538,20 @@ class MenuBar(NSObject):
         latest = store.latest()
         self.reviewed = latest.name if latest else None  # the scan shown last
         self.seen = Snapshot()  # counters already acted on
-        self.quitting = False
-        self.icons = {via: status_icon(via) for via in (None, *Via)}
-        self.shimmers = {}  # via: the icon's shimmer frames, made when first needed
-        self.shown = None  # the icon shown: via, and whether it shimmers
+        self.quit_state = QuitState.RUNNING
+        # macOS asked to quit (applicationShouldTerminate_) and waits for
+        # replyToApplicationShouldTerminate_ once the quit is done
+        self.reply_when_done = False
+        self.icons = {icon: status_icon(icon) for icon in ICONS}
+        self.shimmers = {}  # by Icon: its shimmer frames, made when first needed
+        self.shown = None  # the Icon shown, and whether it shimmers
         self.animation = None  # the shimmer's timer, while working
         self.frames, self.frame = [], 0
 
         self.item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
         )
-        self.item.button().setImage_(self.icons[None])
+        self.item.button().setImage_(self.icons[Icon(False, None)])
         menu = NSMenu.alloc().init()
         menu.setAutoenablesItems_(False)
         self.wifi_window = None  # opened from the menu
@@ -529,7 +592,17 @@ class MenuBar(NSObject):
             "chooseQuality:",
         )
         processing = self.submenu(menu, TEXT["processing"])
-        self.steps = self.choices(processing, None, STEP_TITLES, "toggleStep:")
+        self.processing: dict[str, dict] = {}  # by option: its items, by value
+        for name, entry in PROCESSING.items():
+            if isinstance(entry, str):  # a switch: checked when on
+                item = self.add(processing, entry, "toggleStep:")
+                item.setRepresentedObject_(name)
+                self.processing[name] = {True: item}
+            else:
+                title, titles = entry
+                self.processing[name] = self.choices(
+                    processing, title, titles, "chooseProcessing:"
+                )
         self.languages = self.choices(
             processing,
             TEXT["language"],
@@ -679,10 +752,11 @@ class MenuBar(NSObject):
                 for code, item in self.languages.items()
             ),
         ]
-        for step, item in self.steps.items():
-            # a step the scan mode rules out shows as off, and cannot be changed
-            checks.append((item, getattr(effective, step)))
-            item.setEnabled_(getattr(effective, step) == getattr(options, step))
+        for name, items in self.processing.items():
+            # an option the scan mode sets shows as it sets it, unchangeable
+            for value, item in items.items():
+                checks.append((item, getattr(effective, name) == value))
+                item.setEnabled_(not options.fixed_by_mode(name))
         for item, on in checks:
             item.setState_(NSControlStateValueOn if on else NSControlStateValueOff)
         self.open_debug.setHidden_(not self.settings.debug)
@@ -692,8 +766,9 @@ class MenuBar(NSObject):
 
     def refresh_(self, _timer) -> None:
         snapshot = self.monitor.snapshot
-        if self.quitting:
+        if self.quit_state == QuitState.FINISHING:
             self.finish_quitting(snapshot)
+        if self.quit_state != QuitState.RUNNING:
             return
         status, detail = describe(snapshot)
         self.status_line.setTitle_(status)
@@ -704,7 +779,7 @@ class MenuBar(NSObject):
         self.window_status.setStringValue_(status)
         self.window_detail.setStringValue_(detail)
         self.window_button.setEnabled_(can_scan(snapshot))
-        self.show_icon(connection(snapshot), busy=working(snapshot))
+        self.show_icon(icon_of(snapshot), busy=working(snapshot))
         loaded = snapshot.paper_loads > self.seen.paper_loads
         saved = snapshot.saved != self.seen.saved
         self.seen = snapshot
@@ -752,21 +827,21 @@ class MenuBar(NSObject):
             self.open_review(latest)
 
     @objc.python_method
-    def show_icon(self, via: Via | None, *, busy: bool) -> None:
-        """The icon for how the scanner is connected; shimmering while busy
+    def show_icon(self, icon: Icon, *, busy: bool) -> None:
+        """icon (icon_of) in the menu bar; shimmering while busy
         (working(); a still, faded frame under Reduce Motion)."""
-        if self.shown == (via, busy):
+        if self.shown == (icon, busy):
             return
-        self.shown = (via, busy)
+        self.shown = (icon, busy)
         if self.animation is not None:
             self.animation.invalidate()
             self.animation = None
         if not busy:
-            self.item.button().setImage_(self.icons[via])
+            self.item.button().setImage_(self.icons[icon])
             return
-        if via not in self.shimmers:
-            self.shimmers[via] = shimmer_frames(self.icons[via])
-        self.frames, self.frame = self.shimmers[via], 0
+        if icon not in self.shimmers:
+            self.shimmers[icon] = shimmer_frames(self.icons[icon])
+        self.frames, self.frame = self.shimmers[icon], 0
         if NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion():
             self.item.button().setImage_(self.frames[len(self.frames) // 2])
             return
@@ -886,6 +961,13 @@ class MenuBar(NSObject):
         step = str(sender.representedObject())
         self.save_setting(f"scan.{step}", not getattr(self.settings.options, step))
 
+    def chooseProcessing_(self, sender) -> None:
+        """A value of a Processing option that is a submenu (PROCESSING)."""
+        (name,) = [
+            n for n, items in self.processing.items() if sender in items.values()
+        ]
+        self.save_setting(f"scan.{name}", str(sender.representedObject()))
+
     def toggleLanguage_(self, sender) -> None:
         """Automatic; or add the language to the text languages, or take it
         out (the last one stays)."""
@@ -921,17 +1003,38 @@ class MenuBar(NSObject):
         app.activateIgnoringOtherApps_(True)
         app.orderFrontStandardAboutPanelWithOptions_(about_options())
 
+    def applicationShouldTerminate_(self, _app) -> int:
+        """A quit from outside the menu (an Apple event, logout, Sparkle
+        relaunching for an update) finishes as Quit does: PDFs made, the
+        scanner released. Without this, macOS ended the app at once: PDFs in
+        progress were lost and the scanner stayed reserved (2026-11-23)."""
+        if self.quit_state == QuitState.DONE:
+            return NSTerminateNow
+        if self.quit_state == QuitState.RUNNING and not self.begin_quitting():
+            return NSTerminateCancel  # the user kept changes under review
+        # refresh_ finishes it and replies: its timer runs in the common
+        # modes, so also while macOS waits
+        self.reply_when_done = True
+        return NSTerminateLater
+
     def quit_(self, _sender) -> None:
         """Quit once the scan in progress is taken in, and the scans taken in
         have their PDFs; changes under review are dropped only if the user
-        agrees."""
+        agrees. Once quitting has begun, it goes on as it is."""
+        if self.quit_state == QuitState.RUNNING and self.begin_quitting():
+            self.refresh_(None)  # nothing in progress: quits now
+
+    @objc.python_method
+    def begin_quitting(self) -> bool:
+        """Stop scanning and start finishing (finish_quitting); False when
+        the user keeps changes under review instead."""
         reviewing = self.review_window
         if reviewing and reviewing.has_changes() and not reviewing.discard_changes():
-            return
+            return False
         self.window.orderOut_(None)
         self.monitor.stop(QUIT_WAIT_SECONDS)
-        self.quitting = True
-        self.refresh_(None)
+        self.quit_state = QuitState.FINISHING
+        return True
 
     @objc.python_method
     def finish_quitting(self, snapshot: Snapshot) -> None:
@@ -943,7 +1046,12 @@ class MenuBar(NSObject):
             )
             return
         NSStatusBar.systemStatusBar().removeStatusItem_(self.item)
-        NSApplication.sharedApplication().terminate_(None)
+        self.quit_state = QuitState.DONE
+        app = NSApplication.sharedApplication()
+        if self.reply_when_done:
+            app.replyToApplicationShouldTerminate_(True)
+        else:
+            app.terminate_(None)  # asks applicationShouldTerminate_: done
 
 
 def menu_languages(chosen: list[str]) -> list[str]:
@@ -1067,7 +1175,8 @@ def main() -> None:
         monitor.Connector(), functools.partial(scan_with_settings, store=store)
     )
     watcher.start()
-    bar = MenuBar.alloc().initWithMonitor_settings_store_(watcher, settings, store)  # noqa: F841 - keep a reference
+    bar = MenuBar.alloc().initWithMonitor_settings_store_(watcher, settings, store)
+    app.setDelegate_(bar)  # quits from outside the menu finish as Quit does
     AppHelper.runEventLoop()
 
 

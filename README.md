@@ -11,9 +11,11 @@ Home.
 
 - One searchable PDF per batch, made in the background while the next
   sheets scan.
-- Straightened, cropped and turned upright; blank sides left out; text pages
-  in black and white, color kept where there is color.
-- The other side's print showing through the paper, and fold shadows,
+- Straightened by the text on the page, cropped and turned upright; blank
+  sides left out; text pages in black and white, color kept where there is
+  color.
+- The other side's print showing through the paper removed from gray and
+  color pages (black and white pages drop it themselves), and fold shadows
   removed.
 - Each page's language recognized, in 36 bundled languages.
 - After a scan, any page can be stored another way (black and white, gray,
@@ -83,9 +85,11 @@ In `~/Library/Application Support/open-scansnap/review`, readable only by
 you, as the scanner sent it (about 7 MB per side), until the next scan.
 
 **Characters or words are missing.**
-Turn off **Processing ▸ Remove show-through** and
+Choose **Processing ▸ Show-through ▸ Keep** and
 [report it](https://github.com/thomergil/open-scansnap/issues/new), with the
-scan if you can share it.
+scan if you can share it. By default, show-through is removed only from
+pages stored in gray or color: black and white pages drop faint
+show-through by themselves.
 
 **The scanner is not found.**
 The iX500 turns on when its paper chute opens. Open ScanSnap also needs

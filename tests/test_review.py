@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +15,7 @@ import pypdfium2
 from PIL import Image, ImageDraw
 
 from openscansnap import config, files, job, pages, review, sane
-from openscansnap.options import ScanMode
+from openscansnap.options import ScanMode, ShowThrough
 
 DPI = 300
 SIZE = (850, 1100)  # pixels: small sides keep the store's writes quick
@@ -215,15 +216,89 @@ class StoreTest(StoredScan):
             self.keep("scan_2")  # prunes
         self.assertTrue((kept.folder / review.RECORD).is_file())
 
-    def test_a_record_of_another_version_reads(self):
+    def test_a_record_a_later_version_wrote_is_left_to_it(self):
+        kept = self.keep("scan_1")
+        record = kept.folder / review.RECORD
+        data = json.loads(record.read_text())
+        # made again here, its PDF would lose that version's settings: it is
+        # left for that version, unread, and so never pruned
+        data["version"] = config.FORMAT + 1
+        data["options"]["setting_of_a_later_version"] = True
+        record.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, "later version"):
+            review.read(kept.folder)
+        with self.assertLogs("openscansnap.review", "WARNING"):
+            self.keep("scan_2")  # prunes
+        self.assertEqual(json.loads(record.read_text()), data)
+
+    def test_a_record_says_its_format(self):
+        kept = self.keep()
+        data = json.loads((kept.folder / review.RECORD).read_text())
+        self.assertEqual(data["version"], config.FORMAT)
+
+    def test_a_record_that_is_no_record_is_refused(self):
+        kept = self.keep()
+        record = kept.folder / review.RECORD
+        for text in ("[]", '"scan"', "3"):
+            record.write_text(text)
+            with self.subTest(text=text), self.assertRaises(TypeError):
+                review.read(kept.folder)
+
+    def test_a_scan_stored_while_the_clock_ran_ahead_does_not_stay_latest(self):
+        # a scan just stored is never pruned in its favor
+        ahead = self.keep("scan_1")
+        record = ahead.folder / review.RECORD
+        data = json.loads(record.read_text())
+        data["made"] = time.time() + 3600
+        record.write_text(json.dumps(data))
+        stored = self.keep("scan_2")
+        self.assertEqual(self.store.latest(), stored)
+        self.assertEqual([scan.name for scan in self.store.scans()], [stored.name])
+
+    def test_a_record_stored_at_no_time_is_refused(self):
         kept = self.keep()
         record = kept.folder / review.RECORD
         data = json.loads(record.read_text())
-        data["options"]["setting_of_a_later_version"] = True
-        del data["options"]["quality"]  # one this version has and it lacks
+        for made in ("NaN", "Infinity"):
+            record.write_text(json.dumps(data).replace(str(data["made"]), made))
+            with self.subTest(made=made), self.assertRaisesRegex(ValueError, "no time"):
+                review.read(kept.folder)
+
+    def test_a_record_whose_version_is_no_number_is_refused(self):
+        kept = self.keep()
+        record = kept.folder / review.RECORD
+        data = json.loads(record.read_text())
+        for version in (0, "2", 2.5, True):
+            data["version"] = version
+            record.write_text(json.dumps(data))
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(config.ConfigError, "version must be"),
+            ):
+                review.read(kept.folder)
+
+    def test_a_record_of_this_version_with_a_value_none_can_have_is_refused(self):
+        kept = self.keep()
+        record = kept.folder / review.RECORD
+        data = json.loads(record.read_text())
+        data["options"]["straighten"] = "yes"
         record.write_text(json.dumps(data))
-        again = review.read(kept.folder)
-        self.assertEqual(again.options.quality, config.default_options().quality)
+        with self.assertRaisesRegex(config.ConfigError, "straighten must be a bool"):
+            review.read(kept.folder)
+
+    def test_a_record_of_0_1_reads_its_show_through_as_it_meant(self):
+        # 0.1.0 and 0.1.1 recorded show-through removal on or off: off stays
+        # off when such a scan is made again, not the new default
+        kept = self.keep()
+        record = kept.folder / review.RECORD
+        data = json.loads(record.read_text())
+        del data["version"]  # 0.1 recorded none
+        del data["options"]["show_through"]
+        data["options"]["remove_show_through"] = False
+        record.write_text(json.dumps(data))
+        self.assertEqual(
+            review.read(kept.folder).options.show_through, ShowThrough.KEEP
+        )
 
 
 class RemakeTest(StoredScan):
@@ -364,6 +439,17 @@ class PreviewTest(StoredScan):
             self.assertEqual(self.store.preview(kept, 2, ScanMode.GRAY), made)
         assembled.assert_not_called()
         self.assertEqual(self.store.latest().page(2), None)  # the PDF's are untouched
+        # another version makes pages otherwise: its preview is not shown
+        with mock.patch.object(review, "__version__", "0.0.1"):
+            self.assertIsNone(kept.preview(2, ScanMode.GRAY))
+
+    def test_a_preview_that_is_a_link_is_not_shown(self):
+        kept = self.keep()
+        made = self.store.preview(kept, 2, ScanMode.GRAY)
+        elsewhere = self.tmp / "elsewhere.png"
+        made.rename(elsewhere)
+        made.symlink_to(elsewhere)
+        self.assertIsNone(kept.preview(2, ScanMode.GRAY))
 
     def test_the_last_sheets_lone_side_is_made(self):
         kept = self.keep(sides=3)

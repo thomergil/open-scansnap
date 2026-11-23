@@ -20,7 +20,7 @@ from ocrmypdf.exceptions import ExitCodeException
 from PIL import Image
 
 from . import languages, pages, pdf, sane, sheet, showthrough
-from .options import LANGUAGE_SEPARATOR, Options, ScanMode
+from .options import LANGUAGE_SEPARATOR, Options, ScanMode, ShowThrough
 
 OUTPUT_NAME = "scan_%Y-%m-%d_%H%M%S"
 PDF_SUFFIX = ".pdf"
@@ -39,6 +39,50 @@ log = logging.getLogger(__name__)
 # (its result's method is then LEFT_OUT)
 LEAVE_OUT = "leave-out"
 Choice = ScanMode | str
+
+
+@dataclass(frozen=True)
+class SheetSide:
+    """One side of a sheet, cropped to its paper: as scanned, and with the
+    other side's show-through removed (cleaned) when the scan removes it.
+    Measures and decisions read the cleaned side, where there is one, so
+    the other side's print does not read as this side's own."""
+
+    scanned: Image.Image
+    cleaned: Image.Image | None = None
+
+    @property
+    def deciding(self) -> Image.Image:
+        """The image measurements and decisions use: cleaned where there is
+        one, else scanned."""
+        return self.scanned if self.cleaned is None else self.cleaned
+
+    def turned_level(self, tilt: float, band: int) -> "SheetSide":
+        """Both images turned alike (sheet.turned_level), so a page made
+        from one matches what was decided on the other."""
+        return SheetSide(
+            sheet.turned_level(self.scanned, tilt, band),
+            None
+            if self.cleaned is None
+            else sheet.turned_level(self.cleaned, tilt, band),
+        )
+
+    def prepared(
+        self, dpi: int, options: Options, turn: int | None
+    ) -> "pages.Page | None":
+        """The side's page (pages.prepare): made and judged from the side as
+        scanned when options keep show-through (Photo, As scanned, or Keep),
+        else judged on the cleaned side. When show_through is
+        gray-and-color, a black and white page takes its ink from the side
+        as scanned: its threshold drops faint show-through itself and keeps
+        the letters lying on the other side's ink, which removal can
+        erase."""
+        show_through = options.in_effect().show_through
+        if self.cleaned is None or show_through == ShowThrough.KEEP:
+            return pages.prepare(self.scanned, dpi, options, turn)
+        if show_through == ShowThrough.EVERY_PAGE:
+            return pages.prepare(self.cleaned, dpi, options, turn)
+        return pages.prepare(self.cleaned, dpi, options, turn, print_from=self.scanned)
 
 
 @dataclass(frozen=True)
@@ -228,46 +272,46 @@ def assemble(
             progress(first // SIDES_PER_SHEET + 1, sheets)
         sheet_sides = sides[first : first + SIDES_PER_SHEET]
         dpi = resolution(sheet_sides[0])
-        images, by_edges = [], []
+        images = []
         for side in sheet_sides:
             with Image.open(side) as image:
                 image = image.convert("RGB")
-                straight = False
                 if options.straighten:
-                    image, straight = sheet.straightened(image, dpi)
+                    image = sheet.straighten_and_crop(image, dpi)
                 images.append(image)
-                by_edges.append(straight)
-        turns = [None] * len(images)
-        if len(images) == SIDES_PER_SHEET:
+        # each side cleaned of the other's show-through, when the scan may
+        # remove it on some page: both sides as the paper has them
+        if len(images) == SIDES_PER_SHEET and options.show_through != ShowThrough.KEEP:
             front, back = images
-            if options.remove_show_through:
-                images = [
-                    showthrough.clean(front, back, dpi),
-                    showthrough.clean(back, front, dpi),
-                ]
-        # a side its edges could not straighten is turned by its text, as its
-        # own mode allows, when the scan straightens (As scanned keeps every
-        # side whole, whatever its choice): after show-through, which needs
-        # both sides as the paper has them, so the other side's print no
-        # longer reads as lines of text
-        images = [
-            image
-            if straight
-            or not options.straighten
-            or not side_options(settings, choices.get(number)).level_text
-            else level_text(image)
-            for number, image, straight in zip(
-                range(first + 1, first + 1 + len(images)), images, by_edges
-            )
-        ]
-        detections = [pages.Detection(image, dpi) for image in images]
+            both = [
+                SheetSide(front, showthrough.clean(front, back, dpi)),
+                SheetSide(back, showthrough.clean(back, front, dpi)),
+            ]
+        else:
+            both = [SheetSide(image) for image in images]
+        # Turn each side level by its text: paper can feed in at a slant of
+        # its own, and the edges, which can run off the scan or be lost
+        # against the backing, straightened it only roughly. As scanned
+        # keeps every side whole, whatever a side's choice; a side without
+        # text keeps the edges' turn.
+        for index, number in enumerate(range(first + 1, first + 1 + len(both))):
+            if not (
+                options.straighten
+                and side_options(settings, choices.get(number)).level_text
+            ):
+                continue
+            tilt = text_turn(both[index].deciding)
+            if tilt is not None:
+                both[index] = both[index].turned_level(tilt, pages.edge_band(dpi))
+        detections = [pages.Detection(side.deciding, dpi) for side in both]
         side_languages = [language_of(side, options, installed) for side in detections]
-        if options.upright and len(images) == SIDES_PER_SHEET:
+        turns: list[int | None] = [None] * len(both)
+        if options.upright and len(both) == SIDES_PER_SHEET:
             turns = sheet_turns(detections, side_languages)
         elif options.upright:  # one side: turned here, from its own detection
             turns = [pages.orientation(detections[0], side_languages[0]) or 0]
-        for number, (image, turn, language) in enumerate(
-            zip(images, turns, side_languages), first + 1
+        for number, (side, turn, language) in enumerate(
+            zip(both, turns, side_languages), first + 1
         ):
             choice = choices.get(number)
             if choice == LEAVE_OUT:
@@ -275,7 +319,7 @@ def assemble(
                 results.append(SideResult(number, None, LEFT_OUT, None))
                 continue
             chosen = replace(side_options(settings, choice), language=language)
-            result = prepare_side(image, dpi, chosen, pages_dir, number, turn)
+            result = prepare_side(side, dpi, chosen, pages_dir, number, turn)
             results.append(result)
             if result.page is not None:
                 saved.append(result.page)
@@ -291,18 +335,18 @@ def side_options(settings: Options, choice: Choice | None) -> Options:
     return replace(settings, mode=ScanMode(choice), remove_blank=False)
 
 
-def level_text(side: Image.Image) -> Image.Image:
-    """side with its text turned level when it is measurably askew
-    (pages.text_tilt); as it is when that cannot be measured."""
+def text_turn(side: Image.Image) -> float | None:
+    """The angle side's text is turned by (radians, counterclockwise) when
+    it is measurably askew (pages.text_tilt); None when level, without
+    text, or not measurable."""
     try:
         tilt = pages.text_tilt(side)
-    except sane.ScanError as e:  # levelling is a refinement: the page stands
+    except sane.ScanError as e:  # without a measure, the side keeps the edges' turn
         log.warning("text tilt not measured: %s", e)
-        return side
-    if tilt is None:
-        return side
-    log.debug("text tilt %.2f degrees, turned level", math.degrees(tilt))
-    return sheet.turned_level(side, tilt)
+        return None
+    if tilt is not None:
+        log.debug("text tilt %.2f degrees, turned level", math.degrees(tilt))
+    return tilt
 
 
 def resolution(side: Path) -> int:
@@ -343,15 +387,16 @@ def sheet_turns(sides: list[pages.Detection], side_languages: list[str]) -> list
 
 
 def prepare_side(
-    image: Image.Image,
+    side: SheetSide,
     dpi: int,
     options: Options,
     pages_dir: Path,
     number: int,
     turn: int | None,
 ) -> SideResult:
-    """The side's page, saved to pages_dir, or none when it is blank."""
-    page = pages.prepare(image, dpi, options, turn)
+    """The side's page (SheetSide.prepared), saved to pages_dir, or none
+    when it is blank."""
+    page = side.prepared(dpi, options, turn)
     if page is None:
         log.info("side %d: blank, dropped", number)
         return SideResult(number, None, BLANK, None)

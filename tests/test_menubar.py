@@ -12,7 +12,7 @@ from offscreen import Offscreen
 
 from openscansnap import job, options
 from openscansnap.monitor import Snapshot, State, Via
-from openscansnap.options import Quality, ScanMode
+from openscansnap.options import Quality, ScanMode, ShowThrough
 
 APPKIT = importlib.util.find_spec("AppKit") is not None
 
@@ -105,25 +105,105 @@ class MenuBarTest(Offscreen):
                 )[1]
                 self.assertIn(self.menubar.HINT[state], detail)
 
+    def quitting_bar(self, snapshot: Snapshot, keeps_changes: bool = False):
+        """A stand-in MenuBar running the real quit methods, with the scanner
+        at snapshot (set bar.monitor.snapshot to move on)."""
+        bar_class = self.menubar.MenuBar
+        reviewing = mock.Mock()
+        reviewing.has_changes.return_value = keeps_changes
+        reviewing.discard_changes.return_value = False
+        bar = SimpleNamespace(
+            status_line=mock.Mock(),
+            item=object(),
+            window=mock.Mock(),
+            review_window=reviewing,
+            monitor=mock.Mock(snapshot=snapshot),
+            quit_state=self.menubar.QuitState.RUNNING,
+            reply_when_done=False,
+        )
+        bar.begin_quitting = lambda: bar_class.begin_quitting(bar)
+        bar.finish_quitting = lambda s: bar_class.finish_quitting(bar, s)
+        bar.refresh_ = lambda timer: bar_class.refresh_(bar, timer)
+        bar.quit_ = lambda sender: bar_class.quit_(bar, sender)
+        bar.ask = lambda: bar_class.applicationShouldTerminate_(bar, None)
+        return bar
+
+    def quitting(self):
+        """AppKit's application and status bar, mocked: the application."""
+        app = mock.patch.object(self.menubar, "NSApplication")
+        status_bar = mock.patch.object(self.menubar, "NSStatusBar")
+        self.addCleanup(app.stop)
+        self.addCleanup(status_bar.stop)
+        status_bar.start()
+        return app.start().sharedApplication.return_value
+
     def test_quitting_waits_for_the_scan_in_progress(self):
-        bar = SimpleNamespace(status_line=mock.Mock(), item=object())
-        with (
-            mock.patch.object(self.menubar, "NSApplication") as app,
-            mock.patch.object(self.menubar, "NSStatusBar"),
-        ):
-            terminate = app.sharedApplication.return_value.terminate_
-            for snapshot, title in (
-                (Snapshot(state=State.SCANNING), "Finishing 1 PDF, then quitting…"),
-                (
-                    Snapshot(state=State.SCANNING, making=1),
-                    "Finishing 2 PDFs, then quitting…",
-                ),
-            ):
-                self.menubar.MenuBar.finish_quitting(bar, snapshot)
-                bar.status_line.setTitle_.assert_called_with(title)
-            terminate.assert_not_called()
-            self.menubar.MenuBar.finish_quitting(bar, Snapshot(state=State.READY))
-            terminate.assert_called_once()
+        app = self.quitting()
+        bar = self.quitting_bar(Snapshot(state=State.SCANNING))
+        bar.quit_(None)
+        bar.status_line.setTitle_.assert_called_with("Finishing 1 PDF, then quitting…")
+        bar.monitor.snapshot = Snapshot(state=State.SCANNING, making=1)
+        bar.refresh_(None)
+        bar.status_line.setTitle_.assert_called_with("Finishing 2 PDFs, then quitting…")
+        app.terminate_.assert_not_called()
+        bar.monitor.snapshot = Snapshot(state=State.READY)
+        bar.refresh_(None)
+        app.terminate_.assert_called_once()
+        self.assertEqual(bar.ask(), self.menubar.NSTerminateNow)  # terminate_ asks
+
+    def test_an_idle_quit_from_outside_is_answered_once(self):
+        # logout, an Apple event, an update's relaunch, with nothing in
+        # progress: the answer is "later", then exactly one reply
+        app = self.quitting()
+        bar = self.quitting_bar(Snapshot(state=State.READY))
+        self.assertEqual(bar.ask(), self.menubar.NSTerminateLater)
+        app.terminate_.assert_not_called()
+        app.replyToApplicationShouldTerminate_.assert_not_called()
+        bar.monitor.stop.assert_called_once()  # the scanner is let go
+        bar.refresh_(None)
+        bar.refresh_(None)  # a tick before the app ends: nothing more
+        app.replyToApplicationShouldTerminate_.assert_called_once_with(True)
+        app.terminate_.assert_not_called()
+
+    def test_a_quit_from_outside_waits_for_the_pdfs(self):
+        app = self.quitting()
+        bar = self.quitting_bar(Snapshot(state=State.READY, making=1))
+        self.assertEqual(bar.ask(), self.menubar.NSTerminateLater)
+        bar.refresh_(None)
+        app.replyToApplicationShouldTerminate_.assert_not_called()
+        bar.monitor.snapshot = Snapshot(state=State.READY)
+        bar.refresh_(None)
+        app.replyToApplicationShouldTerminate_.assert_called_once_with(True)
+
+    def test_a_quit_from_outside_during_the_menus_quit_is_answered(self):
+        app = self.quitting()
+        bar = self.quitting_bar(Snapshot(state=State.READY, making=1))
+        bar.quit_(None)
+        self.assertEqual(bar.ask(), self.menubar.NSTerminateLater)
+        bar.monitor.snapshot = Snapshot(state=State.READY)
+        bar.refresh_(None)
+        app.replyToApplicationShouldTerminate_.assert_called_once_with(True)
+        app.terminate_.assert_not_called()
+
+    def test_quit_from_the_menu_while_quitting_goes_on_as_it_is(self):
+        # asked once whether to drop changes, the scanner let go once
+        app = self.quitting()
+        bar = self.quitting_bar(Snapshot(state=State.READY, making=1))
+        self.assertEqual(bar.ask(), self.menubar.NSTerminateLater)
+        bar.quit_(None)
+        bar.monitor.stop.assert_called_once()
+        bar.review_window.has_changes.assert_called_once()
+        bar.monitor.snapshot = Snapshot(state=State.READY)
+        bar.refresh_(None)
+        app.replyToApplicationShouldTerminate_.assert_called_once_with(True)
+        app.terminate_.assert_not_called()
+
+    def test_a_quit_from_outside_can_be_declined_for_changes_under_review(self):
+        self.quitting()
+        bar = self.quitting_bar(Snapshot(state=State.READY), keeps_changes=True)
+        self.assertEqual(bar.ask(), self.menubar.NSTerminateCancel)
+        self.assertEqual(bar.quit_state, self.menubar.QuitState.RUNNING)
+        bar.monitor.stop.assert_not_called()
 
     def test_networks_of_one_name_are_told_apart(self):
         from openscansnap import monitor, wifiwindow
@@ -149,23 +229,60 @@ class MenuBarTest(Offscreen):
         for state in set(State) - {State.PAPER}:
             self.assertFalse(self.menubar.can_scan(Snapshot(state=state)))
 
-    def test_icon_shows_how_the_scanner_is_connected(self):
-        icons = {via: self.menubar.status_icon(via) for via in (None, *Via)}
+    def test_icon_shows_how_the_scanner_is_connected_or_an_alert(self):
+        Icon, Mark = self.menubar.Icon, self.menubar.Mark
+        shown = [Icon(True, Mark.WIFI), Icon(True, Mark.USB), Icon(False, None)]
+        shown += [Icon(True, Mark.ALERT), Icon(False, Mark.ALERT)]
+        icons = {icon: self.menubar.status_icon(icon) for icon in shown}
         for icon in icons.values():
             self.assertTrue(icon.isTemplate())  # follows the light or dark menu bar
             self.assertGreater(icon.size().height, 0)
-        self.assertIn("on Wi-Fi", icons[Via.WIFI].accessibilityDescription())
-        self.assertIn("on USB", icons[Via.USB].accessibilityDescription())
-        self.assertIn("scanner off", icons[None].accessibilityDescription())
+        described = {i: str(icons[i].accessibilityDescription()) for i in shown}
+        self.assertIn("on Wi-Fi", described[Icon(True, Mark.WIFI)])
+        self.assertIn("on USB", described[Icon(True, Mark.USB)])
+        self.assertIn("attention", described[Icon(False, Mark.ALERT)])
+        self.assertIn("scanner off", described[Icon(False, None)])
         # the letter stays put whichever mark is beside it
-        self.assertEqual(icons[Via.WIFI].size().width, icons[Via.USB].size().width)
-        connection = self.menubar.connection
-        on_states = {
-            s for s in State if connection(Snapshot(state=s, via=Via.USB)) is not None
-        }
-        self.assertEqual(on_states, {State.READY, State.PAPER, State.SCANNING})
+        self.assertEqual(len({icons[i].size().width for i in shown}), 1)
+
+    def test_every_icon_the_scanner_can_call_for_is_made(self):
+        made = set(self.menubar.ICONS)  # what MenuBar makes
+        for state in State:
+            for via in (*Via, None):
+                for failure in ("", "Making the PDF failed"):
+                    snapshot = Snapshot(state=state, via=via, failure=failure)
+                    with self.subTest(snapshot=snapshot):
+                        self.assertIn(self.menubar.icon_of(snapshot), made)
+
+    def test_the_icon_follows_the_scanner(self):
+        Icon, Mark = self.menubar.Icon, self.menubar.Mark
+        icon_of = self.menubar.icon_of
+        shown = {s: icon_of(Snapshot(state=s, via=Via.USB)) for s in State}
         self.assertEqual(
-            connection(Snapshot(state=State.PAPER, via=Via.WIFI)), Via.WIFI
+            {s for s, icon in shown.items() if icon == Icon(True, Mark.USB)},
+            {State.READY, State.PAPER, State.SCANNING},
+        )
+        # an error the user must act on: an exclamation mark, not the cable,
+        # and the letter dimmed: the scanner cannot be used
+        self.assertEqual(
+            {s for s, icon in shown.items() if icon == Icon(False, Mark.ALERT)},
+            {
+                State.NOT_SET_UP,
+                State.BAD_CONFIGURATION,
+                State.UNUSABLE,
+                State.BUSY,
+                State.REFUSED,
+            },
+        )
+        self.assertEqual(shown[State.OFFLINE], Icon(False, None))  # off: no error
+        failed = "Making the PDF failed"  # until the next scan
+        self.assertEqual(
+            icon_of(Snapshot(state=State.PAPER, via=Via.WIFI, failure=failed)),
+            Icon(True, Mark.ALERT),
+        )
+        self.assertEqual(
+            icon_of(Snapshot(state=State.OFFLINE, via=Via.WIFI, failure=failed)),
+            Icon(False, Mark.ALERT),  # off as well: dimmed
         )
 
     def test_nothing_is_drawn_up_to_the_edges(self):
@@ -178,8 +295,9 @@ class MenuBarTest(Offscreen):
         )
 
         scale = 2  # a Retina menu bar
-        for via in (None, *Via):
-            icon = self.menubar.status_icon(via)
+        Icon, Mark = self.menubar.Icon, self.menubar.Mark
+        for shown in (Icon(False, None), *(Icon(True, mark) for mark in Mark)):
+            icon = self.menubar.status_icon(shown)
             width = round(icon.size().width * scale)
             height = round(icon.size().height * scale)
             rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
@@ -197,7 +315,7 @@ class MenuBarTest(Offscreen):
             edges += [(0, y) for y in range(height)] + [
                 (width - 1, y) for y in range(height)
             ]
-            with self.subTest(via=via):
+            with self.subTest(icon=shown):
                 self.assertEqual(
                     max(rep.colorAtX_y_(x, y).alphaComponent() for x, y in edges), 0
                 )
@@ -230,7 +348,7 @@ class MenuBarTest(Offscreen):
             NSMakeSize(1000, 1000), NSStringDrawingUsesDeviceMetrics, None
         ).size
         scale, margin = 8, 8  # pixels per point; white around the icon
-        icon = menubar.status_icon(Via.WIFI)
+        icon = menubar.status_icon(menubar.Icon(True, menubar.Mark.WIFI))
         width = round(icon.size().width * scale) + 2 * margin
         height = round(icon.size().height * scale) + 2 * margin
         rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
@@ -488,9 +606,11 @@ class SettingsMenuTest(Offscreen):
             [quality for quality, item in self.bar.qualities.items() if self.on(item)],
             [Quality.HIGH],
         )
-        for step, item in self.bar.steps.items():
+        for step in self.steps():
             with self.subTest(step=step):
-                self.assertTrue(self.on(item) and item.isEnabled())
+                self.assertTrue(
+                    self.on(self.step(step)) and self.step(step).isEnabled()
+                )
 
     def test_choosing_a_mode_saves_it_and_moves_the_mark(self):
         self.bar.chooseMode_(self.bar.modes[ScanMode.GRAY])
@@ -502,18 +622,82 @@ class SettingsMenuTest(Offscreen):
 
     def test_steps_a_mode_rules_out_show_off_and_cannot_change(self):
         self.bar.chooseMode_(self.bar.modes[ScanMode.PHOTO])
-        for step in ("remove_blank", "remove_show_through", "clean_up"):
-            item = self.bar.steps[step]
+        for step in ("remove_blank", "clean_up"):
+            item = self.step(step)
             self.assertFalse(self.on(item) or item.isEnabled(), step)
         for step in ("straighten", "upright", "searchable"):
-            item = self.bar.steps[step]
+            item = self.step(step)
             self.assertTrue(self.on(item) and item.isEnabled(), step)
+        # show-through: Keep, and no other choice
+        self.assertEqual(self.shown_show_through(), ShowThrough.KEEP)
+        self.assertFalse(
+            any(i.isEnabled() for i in self.bar.processing["show_through"].values())
+        )
         # back to automatic: the steps are as they were
         self.bar.chooseMode_(self.bar.modes[ScanMode.AUTO])
-        self.assertTrue(all(self.on(item) for item in self.bar.steps.values()))
+        self.assertTrue(all(self.on(self.step(step)) for step in self.steps()))
+        self.assertEqual(self.shown_show_through(), ShowThrough.GRAY_AND_COLOR)
+
+    def test_the_menu_shows_what_each_mode_sets(self):
+        for mode in ScanMode:
+            self.bar.chooseMode_(self.bar.modes[mode])
+            fixed = options.MODE_FIXES.get(mode, {})
+            for name, items in self.bar.processing.items():
+                for value, item in items.items():
+                    with self.subTest(mode=mode, name=name, value=value):
+                        self.assertEqual(item.isEnabled(), name not in fixed)
+                        if name in fixed:
+                            self.assertEqual(self.on(item), fixed[name] == value)
+
+    def test_a_choice_the_mode_sets_cannot_change_even_when_it_agrees(self):
+        # Keep chosen, then Photo: Photo keeps too, and the menu still must
+        # not offer the choices Photo ignores
+        self.bar.chooseProcessing_(
+            self.bar.processing["show_through"][ShowThrough.KEEP]
+        )
+        self.bar.toggleStep_(self.step("clean_up"))  # off, as Photo sets it
+        self.bar.chooseMode_(self.bar.modes[ScanMode.PHOTO])
+        self.assertFalse(
+            any(i.isEnabled() for i in self.bar.processing["show_through"].values())
+        )
+        self.assertFalse(self.step("clean_up").isEnabled())
+
+    def steps(self) -> list[str]:
+        """The Processing options that are switches."""
+        return [n for n, items in self.bar.processing.items() if list(items) == [True]]
+
+    def step(self, name: str):
+        """The menu item of the Processing switch name."""
+        return self.bar.processing[name][True]
+
+    def shown_show_through(self) -> str:
+        (shown,) = [
+            v
+            for v, item in self.bar.processing["show_through"].items()
+            if self.on(item)
+        ]
+        return shown
+
+    def test_show_through_is_one_of_three_choices(self):
+        self.assertEqual(
+            [
+                str(item.title())
+                for item in self.bar.processing["show_through"].values()
+            ],
+            ["Remove on gray and color pages", "Remove on every page", "Keep"],
+        )
+        processing = [
+            str(item.title()) for item in self.step("straighten").menu().itemArray()
+        ]
+        self.assertEqual(processing.index("Show-through"), 3)  # after blank pages
+        self.bar.chooseProcessing_(
+            self.bar.processing["show_through"][ShowThrough.KEEP]
+        )
+        self.assertEqual(self.config.load().options.show_through, ShowThrough.KEEP)
+        self.assertEqual(self.shown_show_through(), ShowThrough.KEEP)
 
     def test_switching_a_step_off_and_on(self):
-        item = self.bar.steps["searchable"]
+        item = self.step("searchable")
         self.bar.toggleStep_(item)
         self.assertFalse(self.config.load().options.searchable)
         self.assertFalse(self.on(item))

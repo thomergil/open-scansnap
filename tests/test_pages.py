@@ -70,6 +70,27 @@ class PrepareTest(unittest.TestCase):
             page.readable_words, 0.8 * sum(len(t.split()) for t in TEXT * 3)
         )
 
+    def test_a_black_and_white_page_takes_its_ink_from_print_from(self):
+        # the cleaned side decides; the ink is the side as scanned, so a
+        # letter the cleaning took is still there
+        cleaned = text_page()
+        scanned = cleaned.copy()
+        mark = (1800, 3000, 1900, 3060)  # well clear of the text
+        ImageDraw.Draw(scanned).rectangle(mark, fill=(0, 0, 0))
+        page = pages.prepare(cleaned, DPI, OPTIONS, 0, print_from=scanned)
+        self.assertEqual(page.mode, Mode.LINEART)
+        x0, y0, x1, y1 = (n * SCALE for n in mark)
+        ink = ~np.asarray(page.image)
+        self.assertGreater(ink[y0:y1, x0:x1].mean(), 0.9)
+        alone = ~np.asarray(pages.prepare(cleaned, DPI, OPTIONS, 0).image)
+        self.assertLess(alone[y0:y1, x0:x1].mean(), 0.1)
+        # fed upside down: print_from is turned upright with image
+        page = pages.prepare(
+            cleaned.rotate(180), DPI, OPTIONS, 180, print_from=scanned.rotate(180)
+        )
+        ink = ~np.asarray(page.image)
+        self.assertGreater(ink[y0:y1, x0:x1].mean(), 0.9)
+
     def test_upside_down_page_is_turned_upright(self):
         page = pages.prepare(text_page().rotate(180), DPI, OPTIONS)
         self.assertEqual(size_on_paper(page), size_on_paper_of(LETTER))

@@ -1,6 +1,7 @@
 """A sheet's two sides together: cropping, show-through and turning upright,
 each only when the scan's options ask."""
 
+import math
 import shutil
 import tempfile
 import unittest
@@ -8,8 +9,9 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pypdfium2
-from PIL import Image
+from PIL import Image, ImageDraw
 from test_pages import text_page
 from test_sheet import FRAME, LETTER, page, scan
 
@@ -22,9 +24,10 @@ from openscansnap import (
     pages,
     pdf,
     sane,
+    sheet,
     showthrough,
 )
-from openscansnap.options import AUTOMATIC_LANGUAGE, ScanMode
+from openscansnap.options import AUTOMATIC_LANGUAGE, ScanMode, ShowThrough
 
 DPI = 300
 POINTS_PER_INCH = 72
@@ -109,9 +112,9 @@ class AssembleTest(unittest.TestCase):
     def test_sheets_are_cropped_to_their_edges(self):
         self.assertSizes(self.assemble(), [n / DPI for n in LETTER])
 
-    def measured(self, found_edges, mode=ScanMode.AUTO, choices=None):
+    def measured(self, mode=ScanMode.AUTO, choices=None, show_through=None):
         """The sides pages.text_tilt measured, and the sides show-through
-        returned, when the sides' edges were found or not."""
+        returned."""
         cleaned = []
 
         def clean(side, other, dpi):
@@ -120,46 +123,85 @@ class AssembleTest(unittest.TestCase):
             return out
 
         options = replace(
-            config.default_options(),
-            mode=mode,
-            remove_blank=False,
-            searchable=False,
-            remove_show_through=True,
+            config.default_options(), mode=mode, remove_blank=False, searchable=False
         )
+        if show_through is not None:
+            options = replace(options, show_through=show_through)
         pages_dir = self.tmp / "pages"
         pages_dir.mkdir(exist_ok=True)
         with (
-            mock.patch.object(
-                job.sheet, "straightened", side_effect=lambda i, d: (i, found_edges)
-            ),
             mock.patch.object(showthrough, "clean", side_effect=clean),
             mock.patch.object(pages, "text_tilt", return_value=None) as measured,
         ):
             job.assemble(self.sides, pages_dir, options, None, choices)
         return [c.args[0] for c in measured.call_args_list], cleaned
 
-    def test_a_side_its_edges_did_not_straighten_is_turned_by_its_text(self):
-        measured, cleaned = self.measured(found_edges=False)
+    def test_text_straightens_each_side_measured_without_show_through(self):
+        # the edges found this sheet; the text turns it all the same
+        measured, cleaned = self.measured()
         self.assertEqual(len(measured), 2)
         for got, side in zip(measured, cleaned, strict=True):
             self.assertIs(got, side)  # measured as show-through left it
 
-    def test_its_edges_straighten_a_side_they_were_found_on(self):
-        self.assertEqual(self.measured(found_edges=True)[0], [])
-
     def test_a_photo_is_not_turned_by_lines_in_it(self):
-        self.assertEqual(self.measured(False, ScanMode.PHOTO)[0], [])
+        self.assertEqual(self.measured(ScanMode.PHOTO)[0], [])
         # a side's own choice decides for that side
-        measured, cleaned = self.measured(False, choices={2: ScanMode.PHOTO})
+        measured, cleaned = self.measured(choices={2: ScanMode.PHOTO})
         self.assertEqual(len(measured), 1)
         self.assertIs(measured[0], cleaned[0])
-        measured, _ = self.measured(False, ScanMode.PHOTO, {1: ScanMode.GRAY})
-        self.assertEqual(len(measured), 1)
+        self.assertEqual(len(self.measured(ScanMode.PHOTO, {1: ScanMode.GRAY})[0]), 1)
 
     def test_as_scanned_turns_no_side_whatever_its_choice(self):
         # the whole scan, backing and all: what Leptonica misreads
-        measured, _ = self.measured(False, ScanMode.AS_SCANNED, {1: ScanMode.COLOR})
+        measured, _ = self.measured(ScanMode.AS_SCANNED, {1: ScanMode.COLOR})
         self.assertEqual(measured, [])
+
+    def test_show_through_kept_cleans_nothing(self):
+        self.assertEqual(self.measured(show_through=ShowThrough.KEEP)[1], [])
+
+    def test_show_through_is_removed_where_the_setting_says(self):
+        # the cleaned side decides, once; a black and white page's threshold
+        # drops faint show-through itself, and cleaning can take letters: by
+        # default its ink comes from the side as scanned
+        plain, clean = Image.new("RGB", (40, 40)), Image.new("RGB", (40, 40))
+        default = config.default_options()
+        cases = (
+            (ShowThrough.GRAY_AND_COLOR, ScanMode.AUTO, clean, clean, plain),
+            (ShowThrough.EVERY_PAGE, ScanMode.AUTO, clean, clean, None),
+            (ShowThrough.KEEP, ScanMode.AUTO, clean, plain, None),
+            (ShowThrough.GRAY_AND_COLOR, ScanMode.AUTO, None, plain, None),
+            # a side whose mode keeps show-through: made as scanned
+            (ShowThrough.EVERY_PAGE, ScanMode.PHOTO, clean, plain, None),
+            (ShowThrough.GRAY_AND_COLOR, ScanMode.AS_SCANNED, clean, plain, None),
+        )
+        for show_through, mode, cleaned, decides, print_from in cases:
+            page = mock.Mock(mode=pages.Mode.LINEART, method="m", readable_words=1)
+            with (
+                self.subTest(show_through=show_through, mode=mode, cleaned=cleaned),
+                mock.patch.object(pages, "prepare", return_value=page) as prepare,
+                mock.patch.object(pdf, "save_page", return_value=self.tmp / "p"),
+            ):
+                options = replace(default, show_through=show_through, mode=mode)
+                side = job.SheetSide(plain, cleaned)
+                job.prepare_side(side, DPI, options, self.tmp, 1, None)
+                prepare.assert_called_once()
+                self.assertIs(prepare.call_args.args[0], decides)
+                self.assertIs(prepare.call_args.kwargs.get("print_from"), print_from)
+
+    def test_a_back_blank_once_cleaned_is_dropped(self):
+        # a blank back with the front's print soaked through: blank by
+        # default, as it was when every side was decided cleaned
+        # (a letter sample, 2026-11-23)
+        clean = Image.new("RGB", (1200, 1600), (250,) * 3)
+        soaked = clean.copy()
+        draw = ImageDraw.Draw(soaked)
+        for y in range(200, 1400, 60):
+            draw.rectangle((150, y, 1050, y + 18), fill=(60,) * 3)
+        options = replace(config.default_options(), language="eng")
+        self.assertIsNotNone(pages.prepare(soaked, DPI, options))  # as scanned
+        side = job.SheetSide(soaked, clean)
+        result = job.prepare_side(side, DPI, options, self.tmp, 2, 0)
+        self.assertIsNone(result.page)
 
     @unittest.skipUnless(bundle.leptonica(), "needs Leptonica")
     def test_text_askew_comes_out_level(self):
@@ -170,27 +212,21 @@ class AssembleTest(unittest.TestCase):
                 askew = page.rotate(
                     degrees, resample=Image.Resampling.BICUBIC, fillcolor="white"
                 )
-                level = job.level_text(askew)
+                level = sheet.turned_level(askew, job.text_turn(askew), askew.width)
                 skew = leptonica.find_skew(pages.binarized(level))
                 self.assertLess(abs(skew.degrees), 0.1)
 
-    def test_a_side_askew_is_turned_level_whole(self):
+    def test_a_tilt_that_cannot_be_measured_turns_nothing(self):
         side = Image.new("RGB", (400, 600), "white")
         with mock.patch.object(pages, "text_tilt", return_value=None):
-            self.assertIs(job.level_text(side), side)
-        with mock.patch.object(pages, "text_tilt", return_value=0.02):
-            level = job.level_text(side)
-        self.assertGreater(level.width, side.width)  # turned, nothing cut
-
-    def test_a_tilt_that_cannot_be_measured_leaves_the_side(self):
-        side = Image.new("RGB", (400, 600), "white")
+            self.assertIsNone(job.text_turn(side))
         with (
             mock.patch.object(
                 pages, "text_tilt", side_effect=sane.ScanError("cannot read")
             ),
             self.assertLogs("openscansnap.job", "WARNING"),
         ):
-            self.assertIs(job.level_text(side), side)
+            self.assertIsNone(job.text_turn(side))
 
     def test_as_scanned_keeps_the_whole_scan(self):
         self.assertSizes(
@@ -216,13 +252,61 @@ class AssembleTest(unittest.TestCase):
         (front, back, _), (back_again, front_again, _) = (
             c.args for c in clean_calls.call_args_list
         )
-        # each side is cleaned of the other side as scanned
+        # each side is cleaned of the other side as scanned; both, as scanned
+        # and cleaned, go to be stored (SheetSide.prepared picks), and the
+        # cleaned ones are what is turned upright
         self.assertIs(front, front_again)
         self.assertIs(back, back_again)
         stored = [c.args[0] for c in prepare.call_args_list]
-        self.assertEqual([cleaned[id(image)][0] for image in stored], [front, back])
-        self.assertEqual([side.image for side in turns.call_args.args[0]], stored)
+        self.assertEqual([side.scanned for side in stored], [front, back])
+        self.assertEqual(
+            [cleaned[id(side.cleaned)][0] for side in stored], [front, back]
+        )
+        self.assertEqual(
+            [side.image for side in turns.call_args.args[0]],
+            [side.cleaned for side in stored],
+        )
         self.assertEqual([c.args[5] for c in prepare.call_args_list], [90, 270])
+
+    def test_text_turns_the_side_as_scanned_and_as_cleaned_alike(self):
+        # a black and white page's ink comes from the side as scanned, its
+        # decisions from the cleaned side: they must line up
+        with Image.open(self.sides[0]) as raw:
+            straight = sheet.straighten_and_crop(raw.convert("RGB"), DPI).size
+        for show_through in ShowThrough:
+            got = []
+
+            def prepare_side(side, dpi, options, pages_dir, number, turn, got=got):
+                got.append(side)
+                page = pages_dir / f"{number}.png"
+                return job.SideResult(number, pages.Mode.LINEART, "otsu", page)
+
+            options = replace(
+                config.default_options(),
+                remove_blank=False,
+                searchable=False,
+                language="eng",
+                show_through=show_through,
+            )
+            with (
+                self.subTest(show_through=show_through),
+                mock.patch.object(pages, "text_tilt", return_value=math.radians(1)),
+                mock.patch.object(job, "prepare_side", side_effect=prepare_side),
+                mock.patch.object(  # cleaned as the side itself: equal pixels
+                    showthrough, "clean", side_effect=lambda side, *_: side.copy()
+                ),
+            ):
+                job.assemble(self.sides, self.tmp, options)
+                side = got[0]
+                self.assertLess(side.scanned.width, straight[0])  # turned and cut
+                if show_through == ShowThrough.KEEP:
+                    self.assertIsNone(side.cleaned)
+                else:  # turned alike, pixel for pixel
+                    self.assertTrue(
+                        np.array_equal(
+                            np.asarray(side.scanned), np.asarray(side.cleaned)
+                        )
+                    )
 
     def test_no_language_is_detected_on_a_blank_side(self):
         blank = Image.new("RGB", (2550, 3300), "white")
@@ -237,7 +321,7 @@ class AssembleTest(unittest.TestCase):
     def test_each_side_is_read_in_its_language_and_the_pdf_in_all(self):
         read_in = []
 
-        def prepare_side(image, dpi, options, pages_dir, number, turn):
+        def prepare_side(side, dpi, options, pages_dir, number, turn):
             read_in.append(options.language)
             page = pages_dir / f"{number}.png"
             return job.SideResult(number, pages.Mode.LINEART, "otsu", page)
@@ -303,7 +387,7 @@ class AssembleTest(unittest.TestCase):
             mock.patch.object(showthrough, "clean") as clean,
             mock.patch.object(job, "sheet_turns") as turns,
         ):
-            self.assemble(remove_show_through=False, upright=False)
+            self.assemble(show_through=ShowThrough.KEEP, upright=False)
         clean.assert_not_called()
         turns.assert_not_called()
 

@@ -26,8 +26,7 @@ EXPECTED = "expected.toml"
 WORDS_KEPT = 0.95
 # a stored page's text lines are level to within this, as Leptonica measures
 # them: the half degree a reader sees (an off-white letter came out 0.9
-# degrees off, 2026-11-23). A page its edges straightened keeps the tilt of
-# its text on the paper: up to about 0.3 degrees on the owner's scans.
+# degrees off, a sheet running off the scan 1.1, 2026-11-23)
 LEVEL_DEGREES = 0.5
 
 

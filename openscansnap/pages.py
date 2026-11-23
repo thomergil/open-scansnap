@@ -138,12 +138,19 @@ class Page:
 
 
 def prepare(
-    image: Image.Image, dpi: int, options: Options, turn: int | None = None
+    image: Image.Image,
+    dpi: int,
+    options: Options,
+    turn: int | None = None,
+    print_from: Image.Image | None = None,
 ) -> Page | None:
     """The stored form of one side, already cropped to the sheet; None when
     it is blank and blank sides are left out. turn is the clockwise turn
     that makes it upright, when already known (from the sheet's other side);
-    None finds it here."""
+    None finds it here. Blankness, turn, mode and threshold method are
+    judged on image; a black and white page takes its ink from print_from
+    instead, when given (the same side, in other pixels), binarized the way
+    image read best."""
     if options.automatic_language:
         raise ValueError("pages.prepare needs the side's language (job.language_of)")
     options = options.in_effect()
@@ -156,6 +163,7 @@ def prepare(
     elif turn is None:
         turn = orientation(Detection(image, dpi), options.language) or 0
     image = turned(image, turn)
+    print_from = image if print_from is None else turned(print_from, turn)
     auto = options.mode == ScanMode.AUTO
     faint = contrast < INK
     color = auto and (
@@ -171,11 +179,11 @@ def prepare(
     # Faint sides, and sides that may become black and white, are read:
     # binarized by Otsu's threshold, and with clean-up also with the
     # paper's shading (creases) divided out, whichever reads best.
+    binarize = {"otsu": lambda gray: gray}
+    if options.clean_up:
+        binarize["otsu-flat"] = flatten
     gray = np.asarray(image.convert("L"))
-    sources = {
-        "otsu": gray,
-        **({"otsu-flat": flatten(gray)} if options.clean_up else {}),
-    }
+    sources = {name: way(gray) for name, way in binarize.items()}
     limits = {name: threshold_otsu(source) for name, source in sources.items()}
     candidates = {name: sources[name] <= limits[name] for name in sources}
     with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
@@ -205,8 +213,12 @@ def prepare(
     if auto and not readable:
         return stored(image, dpi, options, Mode.GRAY, "no readable text", scores[best])
 
+    source, limit = sources[best], limits[best]
+    if print_from is not image:
+        source = binarize[best](np.asarray(print_from.convert("L")))
+        limit = threshold_otsu(source)
     factor = options.lineart_dpi / dpi
-    ink = upscale(sources[best], factor) <= limits[best]
+    ink = upscale(source, factor) <= limit
     if options.clean_up:
         clear_edge_marks(ink, edge_band(options.lineart_dpi))
     return Page(

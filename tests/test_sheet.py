@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
 
-from openscansnap import sheet
+from openscansnap import pages, sheet
 
 DPI = 300
 LETTER = (2550, 3300)  # 8.5 x 11 inches
@@ -95,29 +95,50 @@ class SheetTest(unittest.TestCase):
             with self.subTest(side=side):
                 self.assertLessEqual(abs(edges[side].position - position), TOLERANCE_PX)
 
-    def test_text_turned_level_keeps_all_of_the_sheet(self):
-        # a sheet with dark marks in every corner: none may be cut off
+    def test_text_turned_level_keeps_the_sheets_edges_at_the_border(self):
+        # after a small turn the sheet's own edges stay at the image's border,
+        # within the edge band (where pages.clear_edge_marks clears the
+        # iX500's edge shadow), and the content stays: an outline drawn on
+        # the sheet's edges must end up on the image's
         sheet_image = Image.new("RGB", LETTER, (PAPER,) * 3)
         draw = ImageDraw.Draw(sheet_image)
         width, height = LETTER
-        for x, y in (
-            (0, 0),
-            (width - 40, 0),
-            (0, height - 40),
-            (width - 40, height - 40),
-        ):
-            draw.rectangle((x, y, x + 39, y + 39), fill=(INK,) * 3)
-        for degrees in (0.5, -2.0, 6.0):
+        draw.rectangle((0, 0, width - 1, height - 1), outline=(INK,) * 3, width=2)
+        draw.rectangle((1000, 1500, 1500, 1800), fill=(INK,) * 3)  # the content
+        band = pages.edge_band(DPI)
+        for degrees in (0.5, -0.5):
             with self.subTest(degrees=degrees):
-                level = sheet.turned_level(sheet_image, np.radians(degrees))
-                gray = np.asarray(level.convert("L"))
-                ink = (gray < (PAPER + INK) / 2).sum()
-                self.assertAlmostEqual(ink / (4 * 40 * 40), 1, delta=0.05)
-                # the corners the turn brings in are paper, not black
-                self.assertGreater(
-                    gray[0, 0] if degrees > 0 else gray[0, -1], PAPER - 3
+                level = sheet.turned_level(sheet_image, np.radians(degrees), band)
+                ink = np.asarray(level.convert("L")) < (PAPER + INK) / 2
+                content = ink[1550:1750, 1050:1450].copy()
+                outline = ink.copy()
+                outline[1400:1900, 900:1600] = False  # the content's surroundings
+                ys, xs = np.nonzero(outline)
+                to_border = np.minimum.reduce(
+                    [xs, ys, level.width - 1 - xs, level.height - 1 - ys]
                 )
-                self.assertGreater(level.width, width)
+                self.assertLessEqual(int(to_border.max()), 2)  # on the border
+                self.assertGreater(content.mean(), 0.9)
+
+    def test_a_large_text_turn_cuts_no_more_than_the_band(self):
+        # a crooked copy, 4 degrees: the largest upright rectangle would cut
+        # 10 mm off each side; print 5 mm from the edge stays
+        sheet_image = Image.new("RGB", LETTER, (PAPER,) * 3)
+        width, height = LETTER
+        near = sheet.pixels(5.0, DPI)
+        mark = (near, height // 2 - 40, near + 30, height // 2 + 40)
+        ImageDraw.Draw(sheet_image).rectangle(mark, fill=(INK,) * 3)
+        band = pages.edge_band(DPI)
+        for degrees in (4.0, -4.0):
+            with self.subTest(degrees=degrees):
+                level = sheet.turned_level(sheet_image, np.radians(degrees), band)
+                # cut, and by the band exactly: the rectangle would cut more
+                self.assertEqual(level.size, (width - 2 * band, height - 2 * band))
+                gray = np.asarray(level.convert("L"))
+                left = gray[:, : near + 60]
+                self.assertTrue((left < (PAPER + INK) / 2).any())  # the mark
+                corner = int(gray[0, 0])  # filled with the paper, not black
+                self.assertAlmostEqual(corner, PAPER, delta=3)
 
     def test_a_wavy_edge_is_still_an_edge(self):
         # the waviest real edge measured scattered 3.5 mm from its line; this
@@ -138,16 +159,23 @@ class SheetTest(unittest.TestCase):
                 askew = image.rotate(
                     degrees, resample=Image.Resampling.BICUBIC, fillcolor=(tone,) * 3
                 )
-                level = sheet.turned_level(askew, np.radians(degrees))
+                level = sheet.turned_level(askew, np.radians(degrees), LETTER[0])
                 gray = np.asarray(level.convert("L"))
                 rows = np.nonzero((gray < (tone + INK) / 2).any(axis=1))[0]
                 self.assertLess(rows.max() - rows.min(), 40)  # level again
                 self.assertAlmostEqual(int(gray[0, 0]), tone, delta=3)
 
-    def test_a_scan_without_edges_says_so(self):
-        found = sheet.straightened(scan(page(False), 1.5), DPI)[1]
-        blank = Image.new("RGB", LETTER, (PAPER,) * 3)
-        self.assertEqual((found, sheet.straightened(blank, DPI)[1]), (True, False))
+    def test_an_edge_running_off_the_scan_does_not_read_as_the_border(self):
+        # turned 3 degrees, a letter page is wider than the scan: where its
+        # side runs past the scan's border, that border is no edge of it
+        # (a sheet 2 degrees askew read as 0.3, 2026-11-23)
+        for degrees in (3.0, 2.25):
+            gray = sheet._gray(scan(page(False), degrees))
+            for side in ("left", "right"):
+                edge = sheet.find_edges(gray, DPI)[side]
+                with self.subTest(degrees=degrees, side=side):
+                    self.assertIsNotNone(edge)
+                    self.assertAlmostEqual(np.degrees(edge.tilt), degrees, delta=0.05)
 
     def test_an_edge_whose_samples_scatter_is_not_an_edge(self):
         # paper barely brighter than the backing: on each line, paper is first

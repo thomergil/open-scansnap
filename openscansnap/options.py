@@ -17,9 +17,21 @@ class ScanMode(StrEnum):
     BLACK_AND_WHITE = "black-and-white"
     GRAY = "gray"
     COLOR = "color"
-    PHOTO = "photo"  # color; remove_blank, remove_show_through, clean_up off
+    PHOTO = "photo"  # color, without the document steps (MODE_FIXES, level_text)
     # the scanner's image, uncropped and unturned, at the chosen quality
     AS_SCANNED = "as-scanned"
+
+
+class ShowThrough(StrEnum):
+    """The pages from which show-through (the other side's print showing
+    through the paper) is removed. A black and white page's threshold
+    already drops faint show-through, and removing it there can take letters
+    lying on the other side's ink (a pen scribble behind a typed page cost
+    an s, a u and i-dots, 2026-11-23)."""
+
+    GRAY_AND_COLOR = "gray-and-color"  # pages stored in gray or color
+    EVERY_PAGE = "every-page"
+    KEEP = "keep"  # none
 
 
 class Quality(StrEnum):
@@ -42,6 +54,22 @@ LANGUAGE = re.compile(
 # The language setting for each side's language detected (languages.py),
 # instead of Tesseract names
 AUTOMATIC_LANGUAGE = "auto"
+# The settings each mode fixes, whatever the user chose: a photo is not a
+# document, and As scanned changes nothing
+MODE_FIXES = {
+    ScanMode.PHOTO: {
+        "remove_blank": False,
+        "show_through": ShowThrough.KEEP,
+        "clean_up": False,
+    },
+    ScanMode.AS_SCANNED: {
+        "straighten": False,
+        "upright": False,
+        "remove_blank": False,
+        "show_through": ShowThrough.KEEP,
+        "clean_up": False,
+    },
+}
 
 
 def page_dpi(quality: Quality) -> int:
@@ -64,14 +92,18 @@ class Options:
     straighten: bool  # straighten and crop to the sheet
     upright: bool  # turn pages so their text reads upright
     remove_blank: bool
-    remove_show_through: bool
+    show_through: ShowThrough
     clean_up: bool  # creases, shadows, marks at the paper edge
     searchable: bool  # a text layer, by OCR
     language: str  # Tesseract's names, e.g. eng+nld; or AUTOMATIC_LANGUAGE
 
     def __post_init__(self):
         """Raises ValueError for a choice no scan can have."""
-        for name, kind in (("mode", ScanMode), ("quality", Quality)):
+        for name, kind in (
+            ("mode", ScanMode),
+            ("quality", Quality),
+            ("show_through", ShowThrough),
+        ):
             value = getattr(self, name)
             if value not in set(kind):
                 choices = ", ".join(member.value for member in kind)
@@ -87,22 +119,12 @@ class Options:
             )
 
     def in_effect(self) -> "Options":
-        """These options with the steps the mode rules out switched off:
-        a photo is not a document, and As scanned changes nothing."""
-        if self.mode == ScanMode.PHOTO:
-            return replace(
-                self, remove_blank=False, remove_show_through=False, clean_up=False
-            )
-        if self.mode == ScanMode.AS_SCANNED:
-            return replace(
-                self,
-                straighten=False,
-                upright=False,
-                remove_blank=False,
-                remove_show_through=False,
-                clean_up=False,
-            )
-        return self
+        """These options with what the mode sets (MODE_FIXES)."""
+        return replace(self, **MODE_FIXES.get(self.mode, {}))
+
+    def fixed_by_mode(self, name: str) -> bool:
+        """Whether the mode sets the option name, whatever is chosen."""
+        return name in MODE_FIXES.get(self.mode, {})
 
     @property
     def languages(self) -> list[str]:
@@ -115,9 +137,8 @@ class Options:
 
     @property
     def level_text(self) -> bool:
-        """Whether a side its edges did not straighten is turned by its text:
-        when straightening is in effect, and not on a photo, whatever lines
-        are in it."""
+        """Whether a side is turned level by its text: when straightening is
+        in effect, and not on a photo, whatever lines are in it."""
         return self.in_effect().straighten and self.mode != ScanMode.PHOTO
 
     @property

@@ -14,19 +14,20 @@ import contextlib
 import errno
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, replace
 from itertools import repeat
 from pathlib import Path
 
 from PIL import Image
 
-from . import config, files, job, pages, sane
+from . import __version__, config, files, job, pages, sane
 from .options import Options, ScanMode
 
 log = logging.getLogger(__name__)
@@ -35,7 +36,10 @@ RECORD = "scan.json"
 SIDES, PAGES, THUMBS = "sides", "pages", "thumbs"
 PREVIEWS = "previews"  # pages as a choice would store them, made for the window
 SIDE_NAME, THUMB_NAME = "{:04d}.png", "{:04d}.png"
-PREVIEW_NAME = "{:04d}-{}"  # side number, choice; the page's own suffix follows
+# side number, choice, and the app version that made it (another version may
+# store the page differently, so its previews are not reused); the page's
+# own suffix follows
+PREVIEW_NAME = "{:04d}-{}-{}"
 NEW_PREFIX = ".new-"  # being written or removed: not a scan in the store
 THUMB_PIXELS = 240  # the longer side of a thumbnail
 # Lossless and fast enough: 6.6 MB and 0.4 s for a 300 dpi letter side
@@ -83,9 +87,13 @@ class Scan:
 
     def preview(self, number: int, choice: job.Choice) -> Path | None:
         """The side's page as choice would store it, if made (Store.preview);
-        else None."""
+        else None. A link is never shown: the store makes none."""
         found = sorted(
-            (self.folder / PREVIEWS).glob(PREVIEW_NAME.format(number, choice) + ".*")
+            path
+            for path in (self.folder / PREVIEWS).glob(
+                PREVIEW_NAME.format(number, choice, __version__) + ".*"
+            )
+            if not path.is_symlink()
         )
         return found[0] if found else None
 
@@ -106,7 +114,7 @@ class Store:
 
     def latest(self) -> Scan | None:
         scans = self.scans()
-        return max(scans, key=lambda scan: scan.made) if scans else None
+        return newest(scans)
 
     def scans(self) -> list[Scan]:
         """Every scan in the store; a folder that cannot be read is skipped."""
@@ -185,7 +193,7 @@ class Store:
         present = {scan.name for scan in scans if pdf_may_exist(scan.pdf)}
         with self._lock:
             kept = [scan for scan in scans if scan.name in present]
-            latest = max(kept, key=lambda scan: scan.made) if kept else None
+            latest = newest(kept)
             keep = self._held | ({latest.name} if latest else set())
             doomed = []
             for folder in self._folders():
@@ -286,7 +294,9 @@ class Store:
         with tempfile.TemporaryDirectory(prefix=NEW_PREFIX, dir=folder) as work:
             assembled = job.assemble(sides, Path(work), scan.options, None, choices)
             page = assembled.pages[0]  # the one side made, kept as chosen
-            target = folder / (PREVIEW_NAME.format(number, choice) + page.suffix)
+            target = folder / (
+                PREVIEW_NAME.format(number, choice, __version__) + page.suffix
+            )
             shutil.move(page, target)
         return target
 
@@ -414,13 +424,12 @@ def thumbnail(source: Path, target: Path) -> None:
         small.save(target)
 
 
-def options_of(recorded: dict) -> Options:
-    """A scan's recorded settings, read by this version of the app: settings
-    it does not know are left out, and those it misses are the defaults'.
-    Raises ValueError for a value no scan can have."""
-    known = {field.name for field in fields(Options)}
-    defaults = asdict(config.default_options())
-    return Options(**(defaults | {k: v for k, v in recorded.items() if k in known}))
+def options_of(recorded: dict, written: int, where: str) -> Options:
+    """The Options in recorded, a scan's settings in the settings format
+    written (at most config.FORMAT), read as the settings file is
+    (config.scan_options); where names the record in errors. Raises
+    config.ConfigError for a value no scan can have."""
+    return config.scan_options(recorded, written, where)
 
 
 def choice_of(value: str | None) -> job.Choice | None:
@@ -443,8 +452,21 @@ def claim_folder(root: Path, stem: str) -> Path:
             n += 1
 
 
+def newest(scans: list[Scan]) -> Scan | None:
+    """The scan stored last. One stored with a time still to come was
+    stored while the clock ran ahead: it counts as the oldest, so a scan
+    just stored is never pruned in its favor."""
+    now = time.time()
+    return max(
+        scans,
+        key=lambda scan: scan.made if scan.made <= now else -math.inf,
+        default=None,
+    )
+
+
 def write(scan: Scan) -> None:
     record = {
+        config.VERSION_KEY: config.FORMAT,  # of the options; none before 0.1.2
         "pdf": str(scan.pdf),
         "made": scan.made,
         "options": asdict(scan.options),
@@ -465,16 +487,28 @@ def write(scan: Scan) -> None:
 
 def read(folder: Path) -> Scan:
     """The scan stored in folder; raises OSError, ValueError (including a
-    setting no scan can have), KeyError or TypeError when it cannot be read."""
+    record a later version wrote), KeyError, TypeError, RecursionError or
+    config.ConfigError (a setting no scan can have) when it cannot be
+    read."""
     parts = ("", SIDES, PAGES, THUMBS, PREVIEWS, RECORD)
     if any((folder / part).is_symlink() for part in parts):
         raise ValueError(f"{folder.name} holds a link")
     record = json.loads((folder / RECORD).read_text())
+    if not isinstance(record, dict):
+        raise TypeError(f"{folder.name}: {RECORD} holds no record")
+    made = float(record["made"])
+    if not math.isfinite(made):
+        raise ValueError(f"{folder.name} was stored at no time: {made}")
+    written = record.get(config.VERSION_KEY, 1)
+    if type(written) is int and written > config.FORMAT:
+        # made again here, its PDF would lose that version's settings: left
+        # for it (a record that cannot be read is never pruned)
+        raise ValueError(f"{folder.name} was recorded by a later version")
     return Scan(
         folder,
         Path(record["pdf"]),
-        float(record["made"]),
-        options_of(record["options"]),
+        made,
+        options_of(record["options"], written, str(folder / RECORD)),
         tuple(
             Side(
                 int(side["number"]),

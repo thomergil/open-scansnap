@@ -21,8 +21,8 @@ The sheet's tilt, from its left and right sides (they run along the feed),
 straightens the scan; the edges found again on the straightened scan give the
 crop. A side where too few sample lines find paper, or whose samples scatter
 more than EDGE_SCATTER_MM, is not cropped: the result may keep some backing,
-but never loses paper. A side whose edges give no tilt is turned level by
-its text later (turned_level), all of it kept.
+but never loses paper. job.assemble later turns a scan that has text level
+by that text (turned_level): paper can feed in at a slant of its own.
 """
 
 import logging
@@ -72,14 +72,7 @@ class Edge:
 
 
 def straighten_and_crop(image: Image.Image, dpi: int) -> Image.Image:
-    """The sheet in a raw scan, straight and without backing."""
-    return straightened(image, dpi)[0]
-
-
-def straightened(image: Image.Image, dpi: int) -> tuple[Image.Image, bool]:
-    """straighten_and_crop's sheet, and whether its edges gave its tilt:
-    False when no side was found (paper barely brighter than the backing),
-    and the scan is returned as it came."""
+    """The sheet in a raw scan, straight by its edges and without backing."""
     gray = _gray(image)
     edges = find_edges(gray, dpi)
     tilts = _tilts(edges)
@@ -104,22 +97,41 @@ def straightened(image: Image.Image, dpi: int) -> tuple[Image.Image, bool]:
     log.debug("sheet: tilt %s, box %s", tilts, box)
     left, top, right, bottom = (round(v) for v in box)
     if right - left < 1 or bottom - top < 1:
-        return image, bool(tilts)
-    return image.crop((left, top, right, bottom)), bool(tilts)
+        return image
+    return image.crop((left, top, right, bottom))
 
 
-def turned_level(sheet: Image.Image, tilt: float) -> Image.Image:
-    """sheet with a tilt (radians, counterclockwise) undone, all of it kept:
-    the image grows by what the turn reaches past its old outline, and the
-    corners the turn brings in take the image's median tone per channel
-    (the paper's, on a page)."""
+def turned_level(sheet: Image.Image, tilt: float, band: int) -> Image.Image:
+    """sheet (a side cropped to its paper) with a tilt (radians,
+    counterclockwise) undone, cut to the largest upright rectangle inside
+    the turned sheet: its edges stay on the image's border, where the page
+    decisions look for the scanner's edge shadow and a printer's color
+    strips. That costs (half the side) x tan(tilt) off each side: 0.7 mm at
+    0.3 degrees on a letter page, but 7 mm at 3 degrees (a crooked copy).
+    No more than band pixels (the edge band, pages.edge_band) come off a
+    side, so print near the edge stays; the corners left over are filled
+    with the sheet's paper."""
     paper = tuple(round(float(np.median(band))) for band in sheet.split())
-    return sheet.rotate(
-        -float(np.degrees(tilt)),  # PIL turns counterclockwise
+    turned = sheet.rotate(
+        -float(np.degrees(tilt)),  # PIL turns counterclockwise, about the center
         resample=Image.Resampling.BICUBIC,
-        expand=True,
         fillcolor=paper if len(paper) > 1 else paper[0],
     )
+    # the centered upright rectangle whose corners lie on the turned sides:
+    # a cos + b sin = W/2 and a sin + b cos = H/2 for half-sides a, b; past
+    # 45 degrees none fits, and nothing is cut
+    width, height = sheet.size
+    cos, sin = float(np.cos(abs(tilt))), float(np.sin(abs(tilt)))
+    across = cos * cos - sin * sin
+    if across <= 0:
+        return turned
+    a = (width / 2 * cos - height / 2 * sin) / across
+    b = (height / 2 * cos - width / 2 * sin) / across
+    across_cut = min(max(int(np.ceil(width / 2 - a)), 0), band)
+    down_cut = min(max(int(np.ceil(height / 2 - b)), 0), band)
+    if 2 * across_cut >= width or 2 * down_cut >= height:
+        return turned
+    return turned.crop((across_cut, down_cut, width - across_cut, height - down_cut))
 
 
 def _tilts(edges: dict[str, "Edge | None"]) -> list[float]:
@@ -234,9 +246,14 @@ def _edge(
 
 
 def _depth(line: np.ndarray, half: float, threshold: float, run: int) -> float | None:
-    """Where paper starts on a line from the scan's border inward: where
-    the first rise that reaches paper brightness crosses half (way from the
-    backing's level to the paper's)."""
+    """The position, in pixels from the scan's border inward, at which
+    paper starts on line: where the first rise that reaches paper
+    brightness crosses half (halfway from the backing's level to the
+    paper's). None when the line finds no paper, or
+    no backing before it: there the sheet runs past the scan's border, and
+    its edge is out of sight (a sheet turned 2.25 degrees is wider than the
+    iX500's window: the border, as straight as the scan, read as its edge,
+    2026-11-23)."""
     paper = line > threshold
     lasting = np.convolve(paper, np.ones(run, dtype=int), "valid") == run
     if not lasting.any():
@@ -244,7 +261,7 @@ def _depth(line: np.ndarray, half: float, threshold: float, run: int) -> float |
     end = int(np.argmax(lasting))
     below = np.nonzero(line[:end] <= half)[0]
     if not len(below):
-        return float(end)
+        return None
     i = int(below[-1])  # line[i] <= half < line[i + 1]
     return i + (half - line[i]) / (line[i + 1] - line[i])
 

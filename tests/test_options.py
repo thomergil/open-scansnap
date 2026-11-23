@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 from test_pages import DPI, LETTER, paper, text_page
 
 from openscansnap import config, pages, pdf
-from openscansnap.options import Quality, ScanMode
+from openscansnap.options import Quality, ScanMode, ShowThrough
 from openscansnap.pages import Mode
 
 DEFAULTS = replace(config.default_options(), language="eng")  # pages.prepare: one
@@ -32,21 +32,26 @@ class InEffectTest(unittest.TestCase):
 
     def test_photo_drops_the_document_clean_up(self):
         photo = replace(DEFAULTS, mode=ScanMode.PHOTO).in_effect()
-        self.assertFalse(
-            photo.remove_blank or photo.remove_show_through or photo.clean_up
-        )
+        self.assertFalse(photo.remove_blank or photo.clean_up)
+        self.assertEqual(photo.show_through, ShowThrough.KEEP)
         self.assertTrue(photo.straighten and photo.upright and photo.searchable)
 
     def test_as_scanned_changes_nothing(self):
         raw = replace(DEFAULTS, mode=ScanMode.AS_SCANNED).in_effect()
         self.assertFalse(
-            raw.straighten
-            or raw.upright
-            or raw.remove_blank
-            or raw.remove_show_through
-            or raw.clean_up
+            raw.straighten or raw.upright or raw.remove_blank or raw.clean_up
         )
+        self.assertEqual(raw.show_through, ShowThrough.KEEP)
         self.assertTrue(raw.searchable)  # a text layer does not change the image
+
+    def test_show_through_is_one_of_three_and_gray_and_color_by_default(self):
+        self.assertEqual(DEFAULTS.show_through, ShowThrough.GRAY_AND_COLOR)
+        self.assertIs(
+            replace(DEFAULTS, show_through="every-page").show_through,
+            ShowThrough.EVERY_PAGE,
+        )
+        with self.assertRaisesRegex(ValueError, "show_through must be one of"):
+            replace(DEFAULTS, show_through="sometimes")
 
     def test_text_turns_a_side_only_where_straightening_is_in_effect(self):
         options = config.default_options()

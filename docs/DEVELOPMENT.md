@@ -26,10 +26,15 @@ Each step below runs as far as the scan's settings ask (see Settings).
    scatter more than 6 mm from its line (`sheet.EDGE_SCATTER_MM`) is ignored.
 3. **`openscansnap.showthrough`** paints out the other side's print where it
    shows or bleeds through the paper: the scanner reads both sides, so the
-   other side is known (mirrored and aligned to this one). Then a side whose
-   edges could not be found is turned until its text is level (Leptonica's
-   `pixFindSkew`, through ctypes, measures the text's tilt), keeping all of
-   the page, except in Photo mode.
+   other side is known (mirrored and aligned to this one). Then each side is
+   turned until its text is level (Leptonica's `pixFindSkew`, through ctypes,
+   measures the text's tilt on the cleaned side) and cut to the largest
+   upright rectangle inside it, at most 3 mm a side; a side without text
+   keeps the edges' turn. `openscansnap.pages` judges how the page is stored
+   on the cleaned side (`job.SheetSide`); by default a black and white page
+   takes its ink from the side as scanned, whose threshold drops faint
+   show-through itself. Photo mode skips both show-through removal and text
+   leveling.
 4. **`openscansnap.pages`** decides, page by page, from measurements of
    that page:
    - drop the side if it is blank: nothing on it is clearly darker than the
@@ -198,9 +203,9 @@ documents.
 - **Quality**: Draft, Standard or High: color and gray pages at 150, 200 or
   300 dpi, black and white at twice that.
 - **Processing**: Straighten and crop to the sheet, Turn pages upright,
-  Remove blank pages, Remove show-through, Clean up creases and shadows,
-  Make searchable, each on by default; and the Text language, Automatic by
-  default.
+  Remove blank pages, Clean up creases and shadows, Make searchable, each on
+  by default; Show-through: remove on gray and color pages (the default), on
+  every page, or keep; and the Text language, Automatic by default.
 - Open this window after each scan: a checkbox in the review window itself,
   on by default.
 - The scans folder, Show window when paper is loaded, and Debug mode, which

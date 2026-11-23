@@ -10,21 +10,24 @@ debug = false
 
 [scan]
 # How pages are stored: "auto" (black and white, gray or color, whichever
-# suits each page), "black-and-white", "gray", "color", "photo" (color, with
-# remove_blank, remove_show_through and clean_up off) or "as-scanned" (the
-# scanner's image, uncropped and unturned).
+# suits each page), "black-and-white", "gray", "color", "photo" (color,
+# keeping blank sides and show-through, not cleaned up, not leveled by its
+# text) or "as-scanned" (the scanner's image, uncropped and unturned).
 mode = "auto"
 # "draft", "standard" or "high": color and gray pages at 150, 200 or 300 dpi,
 # black and white at twice that.
 quality = "high"
-# Straighten each sheet and crop it to its edges.
+# Straighten each sheet and crop it to its edges, then level each page by its
+# text, where it has text.
 straighten = true
 # Turn pages so their text reads upright.
 upright = true
 # Leave out blank sides.
 remove_blank = true
-# Paint out the other side's print where it shows through the paper.
-remove_show_through = true
+# Paint out the other side's print where it shows through the paper, on
+# "gray-and-color" pages (black and white pages drop faint show-through by
+# their threshold), on "every-page", or "keep" it everywhere.
+show_through = "gray-and-color"
 # Clear creases, shadows and marks at the paper edge, and put color and gray
 # pages that are mostly paper on white paper.
 clean_up = true
