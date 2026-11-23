@@ -2,8 +2,8 @@
 
 # Open ScanSnap
 
-Scan from a ScanSnap iX500 on your Mac, over Wi-Fi or USB, without ScanSnap
-Home.
+Scan from a ScanSnap scanner on your Mac, over Wi-Fi or USB, without
+ScanSnap Home.
 
 <p><img src="docs/images/menu-bar.png" width="804" alt="Open ScanSnap's menu, open from its icon in the menu bar, with its Processing options and the Show-through choices"></p>
 
