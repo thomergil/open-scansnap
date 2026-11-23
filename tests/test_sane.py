@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from openscansnap import config, job, sane
+from openscansnap import config, files, job, sane
 
 HOST, HOSTID = "192.168.1.20", 0x1122334455667788
 
@@ -189,9 +189,9 @@ class ScannerTest(unittest.TestCase):
             old.write_text("wifi 10.0.0.1\n")
             old.chmod(0o644)
             conf = sane.write_config(sane.Scanner(HOST, HOSTID))
-            self.assertEqual(stat.S_IMODE(conf.stat().st_mode), sane.PRIVATE_FILE)
+            self.assertEqual(stat.S_IMODE(conf.stat().st_mode), files.PRIVATE_FILE)
             self.assertEqual(
-                stat.S_IMODE(sane.CONFIG_DIR.stat().st_mode), sane.PRIVATE_DIR
+                stat.S_IMODE(sane.CONFIG_DIR.stat().st_mode), files.PRIVATE_DIR
             )
             self.assertEqual(conf.read_text().splitlines()[-1], f"wifi {HOST}")
 

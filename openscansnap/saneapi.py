@@ -22,6 +22,8 @@ DEVICE_BUSY = 3
 INVAL = 4
 IO_ERROR = 9
 ACCESS_DENIED = 11
+# Text options are UTF-8; other bytes are kept as lone surrogates
+TEXT_ENCODING, TEXT_ERRORS = "utf-8", "surrogateescape"
 # SANE_Action, SANE_Value_Type
 GET_VALUE, SET_VALUE = 0, 1
 TYPE_BOOL, TYPE_INT, TYPE_FIXED, TYPE_STRING = 0, 1, 2, 3
@@ -49,21 +51,14 @@ class _OptionDescriptor(ctypes.Structure):  # SANE_Option_Descriptor
     ]
 
 
-class _Device(ctypes.Structure):  # SANE_Device
-    _fields_ = [
-        ("name", ctypes.c_char_p),
-        ("vendor", ctypes.c_char_p),
-        ("model", ctypes.c_char_p),
-        ("type", ctypes.c_char_p),
-    ]
-
-
 class Library:
     """libsane, initialised for the scanners configured in config_dir."""
 
     def __init__(self, path: Path = LIBRARY, config_dir: Path | None = None):
         if not path.exists():
-            raise sane.ScanError(f"{path} not found; build SANE first (see README)")
+            raise sane.ScanError(
+                f"{path} not found; build SANE first (see docs/DEVELOPMENT.md)"
+            )
         # read by libsane; scanimage gets the same
         os.environ.update(bundle.sane_environment(config_dir or sane.CONFIG_DIR))
         self._lib = lib = ctypes.CDLL(str(path))
@@ -72,10 +67,6 @@ class Library:
         lib.sane_init.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_void_p]
         lib.sane_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
         lib.sane_close.argtypes = [ctypes.c_void_p]
-        lib.sane_get_devices.argtypes = [
-            ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(_Device))),
-            ctypes.c_int,
-        ]
         lib.sane_get_option_descriptor.restype = ctypes.POINTER(_OptionDescriptor)
         lib.sane_get_option_descriptor.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.sane_control_option.argtypes = [
@@ -91,20 +82,6 @@ class Library:
         if status != GOOD:
             message = self._lib.sane_strstatus(status).decode()
             raise SaneError(status, f"{call}: {message}")
-
-    def devices(self) -> list[str]:
-        """The names of the scanners libsane finds now (on USB, and those
-        configured on the network)."""
-        found = ctypes.POINTER(ctypes.POINTER(_Device))()
-        self.check(
-            self._lib.sane_get_devices(ctypes.byref(found), 1), "sane_get_devices"
-        )
-        names = []
-        i = 0
-        while found[i]:
-            names.append(found[i].contents.name.decode())
-            i += 1
-        return names
 
     def open(self, name: str) -> "Device":
         handle = ctypes.c_void_p()
@@ -146,19 +123,27 @@ class Device:
         return name in self._options
 
     def read_text(self, name: str) -> str:
-        """The current value of a text option."""
+        """The current value of a text option. Bytes that are not UTF-8 (a
+        Wi-Fi network's name can be any bytes) come back as TEXT_ERRORS
+        keeps them, so that write_text sends them back unchanged; shown()
+        makes such text fit to show."""
         number, _, size = self._option(name, (TYPE_STRING,))
         value = ctypes.create_string_buffer(size)
         self._control(name, number, GET_VALUE, value)
-        return value.value.decode()
+        return value.value.decode(TEXT_ENCODING, TEXT_ERRORS)
 
     def write_text(self, name: str, text: str) -> None:
-        """Set a text option (for some, that acts: pairing a HostID)."""
+        """Set a text option (for some, that acts: pairing a HostID). The
+        buffer is zeroed after: the text can hold a passphrase."""
         number, _, size = self._option(name, (TYPE_STRING,))
-        data = text.encode()
+        data = text.encode(TEXT_ENCODING, TEXT_ERRORS)
         if len(data) >= size:
             raise SaneError(INVAL, f"{name}: longer than {size - 1} bytes")
-        self._control(name, number, SET_VALUE, ctypes.create_string_buffer(data, size))
+        buffer = ctypes.create_string_buffer(data, size)
+        try:
+            self._control(name, number, SET_VALUE, buffer)
+        finally:
+            ctypes.memset(buffer, 0, size)
 
     def _option(self, name: str, types: tuple[int, ...]) -> tuple[int, int, int]:
         if not self._handle:
@@ -178,3 +163,9 @@ class Device:
         if self._handle:
             self._lib.sane_close(self._handle)
             self._handle = None
+
+
+def shown(text: str) -> str:
+    """Text from read_text, fit to show: bytes that are not UTF-8 become
+    U+FFFD."""
+    return text.encode(TEXT_ENCODING, TEXT_ERRORS).decode(TEXT_ENCODING, "replace")

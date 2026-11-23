@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Use macOS volume synchronization for dmgbuild's GNU-style sync invocation.
+
+Apple system_cmds/sync/sync.c ignores arguments and synchronizes every filesystem.
+Upstream call: https://github.com/dmgbuild/dmgbuild/blob/v1.6.7/src/dmgbuild/core.py#L770
+API/flags: https://github.com/apple-oss-distributions/Libc/blob/main/include/unistd.h
+Return contract: https://github.com/apple-oss-distributions/Libc/blob/main/gen/sync_volume_np.c
+"""
+
+import ctypes
+import os
+import platform
+import sys
+
+LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
+SYNC_VOLUME_WAIT = 0x02
+FILE_SYSTEM_FLAG = "--file-system"
+USAGE = "Usage: sync --file-system MOUNT_POINT"
+FAILURE = 1
+INVALID_ARGUMENTS = 2
+
+
+def synchronize(path):
+    """Flush only the requested volume; the API returns an error number, preserving errno."""
+    if platform.system() != "Darwin":
+        raise OSError("Volume synchronization requires macOS.")
+    function = ctypes.CDLL(LIBSYSTEM).sync_volume_np
+    function.argtypes = (ctypes.c_char_p, ctypes.c_int)
+    function.restype = ctypes.c_int
+    return function(os.fsencode(path), SYNC_VOLUME_WAIT)
+
+
+def main(arguments):
+    if len(arguments) != 2 or arguments[0] != FILE_SYSTEM_FLAG:
+        print(USAGE, file=sys.stderr)
+        return INVALID_ARGUMENTS
+    try:
+        status = synchronize(arguments[1])
+    except (OSError, AttributeError) as error:
+        print(f"sync: {error}", file=sys.stderr)
+        return FAILURE
+    if status:
+        print(f"sync: {os.strerror(status)}", file=sys.stderr)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

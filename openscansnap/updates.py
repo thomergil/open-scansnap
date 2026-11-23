@@ -1,6 +1,6 @@
 """Software updates for the macOS app, by Sparkle (sparkle-project.org): the
 app checks its feed (Info.plist's SUFeedURL) by itself, and "Check for
-Updates…" asks now. Each release's disk image is signed with the EdDSA key
+updates…" asks now. Each release's disk image is signed with the EdDSA key
 whose public half is SUPublicEDKey.
 
 Only the built app carries Sparkle; run from a checkout there is nothing to

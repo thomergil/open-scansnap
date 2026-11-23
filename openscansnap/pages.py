@@ -8,10 +8,12 @@ Options.mode says. In the automatic mode each page gets what suits it:
 - dropped when blank: nothing on it is clearly darker than the paper, or it
   has only faint marks that Tesseract reads better mirrored (show-through,
   smudges) or, when they do not read as text, that cover less than
-  PICTURE_SHARE of the side (in every mode that removes blank sides);
+  PICTURE_SHARE of the side (in every mode that removes blank sides); a side
+  with colored ink is never blank;
 - color, when any ink on it is colored (a pen stroke, a stamp), judged by
   its CIELAB chroma, or when the page as a whole is colorful (Hasler and
-  Süsstrunk's metric, for photos);
+  Süsstrunk's metric, for photos); with clean-up, a color or gray page that
+  is mostly paper is put on white paper (whitened);
 - black and white otherwise: Otsu's global threshold, on the scan as it is
   or, with clean-up, with the paper's unevenness (shading, the broad shadow
   of folds) divided out first, whichever Tesseract reads best; a global
@@ -24,6 +26,7 @@ Pages are stored at the resolution of the chosen Options.quality.
 """
 
 import csv
+import functools
 import io
 import logging
 import os
@@ -40,7 +43,7 @@ from scipy import ndimage
 from skimage.color import rgb2lab
 from skimage.filters import threshold_otsu
 
-from . import sheet
+from . import leptonica, sheet
 from .options import Options, ScanMode
 
 log = logging.getLogger(__name__)
@@ -79,6 +82,15 @@ POINTS_PER_INCH = 72
 # the edge (a letterhead seal 2 mm from it), or reaches past the band (a
 # rule running off the page).
 EDGE_BAND_MM = 3.0
+# A color or gray page is whitened (on white paper) only when paper (paper_tone,
+# within NOISE_SIGMAS of its grain) is at least this share of it: halfway
+# between what was measured (2026-11-23, iX500), document pages 0.67-0.78
+# (letters with a logo, forms with colored boxes, checklists) and a card
+# with two photos 0.48. Six pages: tune with more. Wrong either way, a page
+# is only left as scanned, or a picture's lightest parts turn white. Paper
+# shaded deeply over much of the page (a deep fold) is left as scanned.
+PAPER_MAJORITY = 0.58
+WHITE = 255
 # Background estimation works on a copy shrunk so that its scale is at
 # least this many pixels: the result is smooth on that scale anyway.
 BACKGROUND_SAMPLES_PER_SCALE = 4
@@ -86,6 +98,12 @@ TESSERACT = "tesseract"
 TESSERACT_LAYOUT = "3"  # automatic page segmentation
 TESSERACT_ORIENTATION = "0"  # orientation and script detection only
 TESSERACT_TOO_LITTLE_TEXT = "Too few characters"  # its reason for no orientation
+# Leptonica's deskew (pixDeskewGeneral) turns a page only when its skew
+# measure is this sure and the turn at least this large (MinAllowedConfidence
+# and MinDeskewAngle in skew.c, Leptonica 1.87). Measured: text pages 4-17,
+# a blank page and a pen drawing 1.2 (2026-11-23).
+SKEW_CONFIDENCE = 3.0
+SKEW_LEAST_DEGREES = 0.1
 ORIENTATION_DATA = "osd"
 TSV_CONFIDENCE, TSV_TEXT = "conf", "text"
 CONFIDENCE_SCALE = 100.0
@@ -126,17 +144,17 @@ def prepare(
     it is blank and blank sides are left out. turn is the clockwise turn
     that makes it upright, when already known (from the sheet's other side);
     None finds it here."""
+    if options.automatic_language:
+        raise ValueError("pages.prepare needs the side's language (job.language_of)")
     options = options.in_effect()
-    gray = np.asarray(image.convert("L"))
-    band = edge_band(dpi)
-    contrast, share = ink_contrast(gray[band:-band, band:-band])
+    contrast, share = side_contrast(image, dpi)
     if options.remove_blank and contrast < NO_INK:
         return None
 
     if not options.upright:
         turn = 0
     elif turn is None:
-        turn = orientation(image, dpi, options.language) or 0
+        turn = orientation(Detection(image, dpi), options.language) or 0
     image = turned(image, turn)
     auto = options.mode == ScanMode.AUTO
     faint = contrast < INK
@@ -176,6 +194,10 @@ def prepare(
         options.remove_blank
         and faint
         and faint_side_is_blank(candidates[best], scores[best], share, dpi, options)
+        # a side with colored ink (C* >= COLORED_INK_CHROMA) is kept: paper,
+        # creases and show-through measure at most C* 8, and a pen drawing can
+        # be too small for PICTURE_SHARE
+        and not (color or has_colored_ink(image, dpi))
     ):
         return None
     if fixed is not None:
@@ -194,6 +216,18 @@ def prepare(
         best,
         scores[best],
     )
+
+
+def side_contrast(image: Image.Image, dpi: int) -> tuple[float, float]:
+    """ink_contrast of a side, its edge band aside (the paper's edge)."""
+    gray = np.asarray(image.convert("L"))
+    band = edge_band(dpi)
+    return ink_contrast(gray[band:-band, band:-band])
+
+
+def has_ink(image: Image.Image, dpi: int) -> bool:
+    """Whether anything on a side is clearly darker than its paper."""
+    return side_contrast(image, dpi)[0] >= NO_INK
 
 
 def faint_side_is_blank(
@@ -216,13 +250,16 @@ def stored(
     method: str,
     readable: float,
 ) -> Page:
-    """A color or gray page at the chosen quality's resolution."""
+    """A color or gray page at the chosen quality's resolution; with clean-up,
+    on white paper (whitened)."""
     if options.page_dpi != dpi:
         factor = options.page_dpi / dpi
         image = image.resize(
             (round(image.width * factor), round(image.height * factor)),
             Image.Resampling.LANCZOS,
         )
+    if options.clean_up:
+        image = whitened(image)
     return Page(
         image.convert("RGB" if mode == Mode.COLOR else "L"),
         options.page_dpi,
@@ -232,23 +269,48 @@ def stored(
     )
 
 
-def orientation(image: Image.Image, dpi: int, language: str) -> int | None:
-    """The clockwise turn (0, 90, 180 or 270 degrees) that makes the page's
+@dataclass(frozen=True, eq=False)
+class Detection:
+    """A side, and what Tesseract's orientation and script detection tells
+    of it (the side's turn, and its script: languages.py); each is worked
+    out once, when first asked for."""
+
+    image: Image.Image
+    dpi: int
+
+    @functools.cached_property
+    def ink(self) -> np.ndarray:
+        return binarized(self.image)
+
+    @functools.cached_property
+    def report(self) -> str | None:
+        """Tesseract's report; None when the side has too little text."""
+        return osd(self.ink, self.dpi)
+
+
+def proposed_turn(report: str | None) -> int:
+    """The clockwise turn Tesseract's orientation report proposes; 0 when it
+    has none."""
+    proposal = OSD_ROTATE.search(report or "")
+    return int(proposal.group(1)) if proposal else 0
+
+
+def turned_ink(ink: np.ndarray, turn: int) -> np.ndarray:
+    """ink turned clockwise by turn degrees."""
+    return np.rot90(ink, k=-turn // QUARTER_TURN)
+
+
+def orientation(side: Detection, language: str) -> int | None:
+    """The clockwise turn (0, 90, 180 or 270 degrees) that makes the side's
     text read upright; None when it has too little text to tell. Tesseract
-    proposes a turn, kept only if the page then reads better."""
-    gray = np.asarray(image.convert("L"))
-    ink = gray <= threshold_otsu(gray)
-    try:
-        report = tesseract(ink, dpi, "--psm", TESSERACT_ORIENTATION)
-    except subprocess.CalledProcessError as e:
-        if TESSERACT_TOO_LITTLE_TEXT in (e.stderr or ""):
-            return None
-        raise
-    proposal = OSD_ROTATE.search(report)
-    turn = int(proposal.group(1)) if proposal else 0
+    proposes a turn, kept only if the side then reads better."""
+    ink, dpi = side.ink, side.dpi
+    if side.report is None:
+        return None
+    turn = proposed_turn(side.report)
     if not turn:
         return 0
-    proposed = np.rot90(ink, k=-turn // QUARTER_TURN)  # clockwise
+    proposed = turned_ink(ink, turn)
     with ThreadPoolExecutor(max_workers=2) as pool:
         as_is, after = pool.map(
             lambda mask: readable_words(mask, dpi, language), (ink, proposed)
@@ -293,13 +355,34 @@ def clear_edge_marks(ink: np.ndarray, band: int) -> None:
     boxes = ndimage.find_objects(labels)
     for number in np.unique(border[border > 0]):
         rows, cols = boxes[number - 1]
-        if (
-            (rows.start == 0 and rows.stop <= band)
-            or (rows.stop == height and rows.start >= height - band)
-            or (cols.start == 0 and cols.stop <= band)
-            or (cols.stop == width and cols.start >= width - band)
-        ):
+        touched = {
+            edge
+            for edge, touches in (
+                ("top", rows.start == 0),
+                ("bottom", rows.stop == height),
+                ("left", cols.start == 0),
+                ("right", cols.stop == width),
+            )
+            if touches
+        }
+        if touched & band_edges(rows, cols, ink.shape, band):
             ink[rows, cols][labels[rows, cols] == number] = False
+
+
+def band_edges(rows: slice, cols: slice, shape: tuple[int, ...], band: int) -> set[str]:
+    """The edges of a page of shape whose band (band pixels wide) holds the
+    whole box (rows, cols): top, bottom, left, right."""
+    height, width = shape[:2]
+    return {
+        edge
+        for edge, within in (
+            ("top", rows.stop <= band),
+            ("bottom", rows.start >= height - band),
+            ("left", cols.stop <= band),
+            ("right", cols.start >= width - band),
+        )
+        if within
+    }
 
 
 def edge_band(dpi: int) -> int:
@@ -320,10 +403,11 @@ def ink_contrast(gray: np.ndarray) -> tuple[float, float]:
 
 
 def has_colored_ink(image: Image.Image, dpi: int) -> bool:
-    """Whether any mark of ink at least LEGIBLE_POINTS tall or wide is
-    colored. Marks are ink by Otsu's threshold; each one's median chroma is
-    measured, so the scanner's slight color fringes on black print do not
-    count."""
+    """Whether any mark of ink at least LEGIBLE_POINTS tall or wide, and not
+    within the edge band, is colored. Marks are ink by Otsu's threshold; each
+    one's median chroma is measured, so the scanner's slight color fringes on
+    black print do not count. The edge band holds no content, but can hold a
+    printer's color calibration strips."""
     step = 2  # half the resolution is plenty to tell a mark's color, and fast
     small = image.convert("RGB").reduce(step)
     gray = np.asarray(small.convert("L"), dtype=np.float64)
@@ -333,8 +417,11 @@ def has_colored_ink(image: Image.Image, dpi: int) -> bool:
         return False
     chroma = np.hypot(*np.moveaxis(rgb2lab(np.asarray(small))[..., 1:], -1, 0))
     smallest = LEGIBLE_POINTS / POINTS_PER_INCH * dpi / step
+    band = edge_band(dpi) // step
     for number, (rows, cols) in enumerate(ndimage.find_objects(labels), 1):
-        if max(rows.stop - rows.start, cols.stop - cols.start) < smallest:
+        if max(rows.stop - rows.start, cols.stop - cols.start) < smallest or band_edges(
+            rows, cols, ink.shape, band
+        ):
             continue
         mark = labels[rows, cols] == number
         if np.median(chroma[rows, cols][mark]) >= COLORED_INK_CHROMA:
@@ -348,6 +435,52 @@ def colorfulness(rgb: np.ndarray) -> float:
     rg = r - g
     yb = (r + g) / 2 - b
     return float(np.hypot(rg.std(), yb.std()) + 0.3 * np.hypot(rg.mean(), yb.mean()))
+
+
+def whitened(image: Image.Image) -> Image.Image:
+    """image on white paper, as a document: the paper's brightness and tint,
+    its folds and shadows included, divided out of each channel (as flatten
+    does), and the paper's grain lifted to white; colored marks keep their
+    color. Unchanged unless paper is at least PAPER_MAJORITY of the page:
+    on a page with less paper than that, a picture's light parts would turn
+    white."""
+    # single precision: a 300 dpi page's channels take half the memory, and
+    # gray levels need far less than float32's precision
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    gray = rgb.mean(axis=2)
+    level, noise = paper_tone(gray)
+    # a document: paper, within its grain of its level, is most of the page;
+    # light parts of a picture are not that close to it
+    if (np.abs(gray - level) <= sheet.NOISE_SIGMAS * noise).mean() < PAPER_MAJORITY:
+        return image
+    # paper, shaded too (folds, shadows): the brighter class, but not what is
+    # more colorful than the paper (a highlighter stroke, a pastel fill)
+    lab = rgb2lab(rgb / WHITE)
+    tint = np.median(
+        lab[..., 1:][np.abs(gray - level) <= sheet.NOISE_SIGMAS * noise], axis=0
+    )
+    colored = np.hypot(*np.moveaxis(lab[..., 1:] - tint, -1, 0)) >= COLORED_INK_CHROMA
+    paper = (gray > threshold_otsu(gray)) & ~colored
+    # paper: about WHITE, in gray levels as the noise is measured
+    flat = rgb / np.maximum(paper_background(rgb, paper), 1.0) * WHITE
+    level, noise = sheet.level_and_noise(flat.mean(axis=2)[paper])
+    white = level - sheet.NOISE_SIGMAS * noise
+    out = np.clip(flat / white * WHITE, 0, WHITE).astype(np.uint8)
+    return Image.fromarray(out, "RGB").convert(image.mode)
+
+
+def paper_tone(gray: np.ndarray) -> tuple[float, float]:
+    """The paper's level, the most common tone of the brighter class by
+    Otsu's threshold; and its grain, the noise between neighboring pixels
+    there, which a picture's spread of tones does not widen."""
+    bright = gray > threshold_otsu(gray)
+    counts, _ = np.histogram(gray[bright], bins=WHITE + 1, range=(0, WHITE + 1))
+    level = float(np.argmax(counts)) + 0.5
+    pairs = bright[:, 1:] & bright[:, :-1]
+    steps = (gray[:, 1:] - gray[:, :-1])[pairs]
+    # a difference of two pixels has sqrt(2) times one pixel's noise
+    noise = sheet.MAD_TO_SIGMA * float(np.median(np.abs(steps))) / np.sqrt(2)
+    return level, max(noise, sheet.QUANTIZATION_SIGMA)
 
 
 def flatten(gray: np.ndarray) -> np.ndarray:
@@ -400,6 +533,28 @@ def upscale(values: np.ndarray, factor: float) -> np.ndarray:
     return np.asarray(image.resize(size, Image.Resampling.BICUBIC))
 
 
+def binarized(image: Image.Image) -> np.ndarray:
+    """image's ink by Otsu's threshold, for Tesseract's detections."""
+    gray = np.asarray(image.convert("L"))
+    return gray <= threshold_otsu(gray)
+
+
+def osd(ink: np.ndarray, dpi: int) -> str | None:
+    """Tesseract's orientation and script report on ink; None when it has
+    too little text to tell."""
+    try:
+        return tesseract(ink, dpi, "--psm", TESSERACT_ORIENTATION)
+    except subprocess.CalledProcessError as e:
+        if TESSERACT_TOO_LITTLE_TEXT in (e.stderr or ""):
+            return None
+        raise
+
+
+def read_text(ink: np.ndarray, dpi: int, language: str) -> str:
+    """The text Tesseract reads in ink."""
+    return tesseract(ink, dpi, "-l", language, "--psm", TESSERACT_LAYOUT)
+
+
 def readable_words(ink: np.ndarray, dpi: int, language: str) -> float:
     """Tesseract's expected number of correctly read words: the sum of its
     word confidences. Rewards both reading more words and reading them
@@ -411,6 +566,17 @@ def readable_words(ink: np.ndarray, dpi: int, language: str) -> float:
         for w in words
         if (w.get(TSV_TEXT) or "").strip() and float(w[TSV_CONFIDENCE]) > 0
     )
+
+
+def text_tilt(image: Image.Image) -> float | None:
+    """How far the lines of text on image are turned, in radians
+    counterclockwise, as Leptonica measures them; None where Leptonica's own
+    deskew would leave the page as it is: too unsure (a page without lines of
+    text), or already level."""
+    skew = leptonica.find_skew(binarized(image))
+    if skew.confidence < SKEW_CONFIDENCE or abs(skew.degrees) < SKEW_LEAST_DEGREES:
+        return None
+    return float(np.radians(skew.degrees))
 
 
 def tesseract(ink: np.ndarray, dpi: int, *args: str) -> str:

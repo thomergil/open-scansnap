@@ -8,8 +8,9 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 ROOT = os.path.abspath(os.path.join(SPECPATH, "..", ".."))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, SPECPATH)
+import languagelist  # noqa: E402
 from licenses import REPLACEABLE_MODULES  # noqa: E402
-from openscansnap import APP_NAME, BUNDLE_ID, __version__, bundle  # noqa: E402
+from openscansnap import APP_NAME, BUNDLE_ID, __version__, bundle, pages  # noqa: E402
 
 MIN_MACOS = "13.0"  # SMAppService, for opening at login
 DEVELOPMENT_REGION = "en"
@@ -20,7 +21,7 @@ LOCAL_NETWORK_USAGE = f"{APP_NAME} talks to your ScanSnap scanner over the local
 UPDATE_FEED = "https://github.com/thomergil/open-scansnap/releases/latest/download/appcast.xml"
 UPDATE_PUBLIC_KEY = "NfcKGFO/rbE7NQkQpTA1ADi/wZsgp9M2Vlnqa8NlaUA="
 TESSDATA = os.path.join(os.environ["TESSERACT_PREFIX"], "share", "tessdata")
-LANGUAGES = ("eng", "osd")  # English text, and orientation detection
+LANGUAGES = ("eng", pages.ORIENTATION_DATA)  # English text, and orientation detection
 # the other languages: packaging/macos/languages.txt, checked by the build
 LANGUAGE_DIR = os.environ["LANGUAGE_DIR"]
 
@@ -38,13 +39,15 @@ datas = [
     (os.path.join(TESSDATA, "configs"), "tesseract/share/tessdata/configs"),
     (os.path.join(TESSDATA, "tessconfigs"), "tesseract/share/tessdata/tessconfigs"),
     (os.path.join(TESSDATA, "pdf.ttf"), "tesseract/share/tessdata"),
+    # the languages listed, which build-macos.sh checked; LANGUAGE_DIR, its
+    # download cache, can hold more
     *[
         (os.path.join(LANGUAGE_DIR, name), "tesseract/share/tessdata")
-        for name in sorted(os.listdir(LANGUAGE_DIR))
-        if name.endswith(".traineddata")
+        for name in languagelist.data_files()
     ],
     (os.environ["LICENSES"], "Licenses"),
     *collect_data_files("ocrmypdf"),
+    *collect_data_files("py3langid"),  # its language model
 ]
 
 a = Analysis(

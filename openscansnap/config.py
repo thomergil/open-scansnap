@@ -13,6 +13,10 @@ DEFAULTS = Path(__file__).with_name("defaults.toml")
 PATH = sane.CONFIG_DIR.parent / "config.toml"
 LOG_DIR = Path.home() / "Library" / "Logs" / "open-scansnap"
 RAW_DIR = LOG_DIR / "raw"  # debug mode keeps each scan's raw sides here
+# the latest scan, kept for review (review.py)
+REVIEW_DIR = (
+    Path.home() / "Library" / "Application Support" / "open-scansnap" / "review"
+)
 FILE_MODE = 0o644
 
 
@@ -26,9 +30,13 @@ class Settings:
     options: Options
     debug: bool
     show_when_paper_loaded: bool
+    review_after_scan: bool
 
 
-def load(path: Path = PATH) -> Settings:
+def load(path: Path | None = None) -> Settings:
+    """The settings in path, PATH by default (read when called, so that
+    PATH can be pointed elsewhere)."""
+    path = path or PATH
     return _settings(_merged(_user(path), path), path)
 
 
@@ -54,21 +62,25 @@ def _settings(raw: dict, path: Path) -> Settings:
         options=options,
         debug=raw["debug"],
         show_when_paper_loaded=raw["window"]["show_when_paper_loaded"],
+        review_after_scan=raw["window"]["review_after_scan"],
     )
 
 
 def home_relative(folder: Path) -> str:
     """folder as the settings file spells it: under the home folder, with ~."""
+    if folder == Path.home():
+        return "~"
     try:
         return f"~/{folder.relative_to(Path.home())}"
     except ValueError:
         return str(folder)
 
 
-def save(name: str, value, path: Path = PATH) -> None:
+def save(name: str, value, path: Path | None = None) -> None:
     """Set one setting (dotted, e.g. "window.show_when_paper_loaded") in the
-    user's file, keeping the others there. The file is rewritten without its
-    comments."""
+    user's file (path, PATH by default, read when called), keeping the others
+    there. The file is rewritten without its comments."""
+    path = path or PATH
     user = _user(path)
     *tables, key = name.split(".")
     table = user

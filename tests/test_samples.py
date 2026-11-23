@@ -1,7 +1,7 @@
 """Regression test on real scans: each folder of samples/ (not in git: the
 owner's own documents) holds a sheet's raw sides as the scanner sent them
 (page0001.tif, ...) and expected.toml, what became of each side when the
-result was checked by eye. Run python tests/test_samples.py --record NAME
+result was checked by eye; every stored page's text must also be level. Run python tests/test_samples.py --record NAME
 to write expected.toml for a sample from the current pipeline."""
 
 import shutil
@@ -23,6 +23,11 @@ EXPECTED = "expected.toml"
 # words read may vary a little with Tesseract's version; a lost word is a
 # regression (show-through removal once took 15% of a letter's words)
 WORDS_KEPT = 0.95
+# a stored page's text lines are level to within this, as Leptonica measures
+# them: the half degree a reader sees (an off-white letter came out 0.9
+# degrees off, 2026-11-23). A page its edges straightened keeps the tilt of
+# its text on the paper: up to about 0.3 degrees on the owner's scans.
+LEVEL_DEGREES = 0.5
 
 
 def outcome(sample: Path) -> list[dict]:
@@ -38,17 +43,25 @@ def outcome(sample: Path) -> list[dict]:
     with (
         tempfile.TemporaryDirectory() as tmp,
         mock.patch.object(pdf, "save_page", side_effect=save_page),
-        mock.patch.object(pdf, "write"),
     ):
-        job.assemble(sides, Path(tmp), Path(tmp), "sample", config.default_options())
+        job.assemble(sides, Path(tmp), config.default_options())
     result = []
     for number in range(1, len(sides) + 1):
         page = saved.get(number)
         if page is None:
             result.append({"mode": "blank"})
         else:
-            result.append({"mode": str(page.mode), "words": words(page)})
+            result.append(
+                {"mode": str(page.mode), "words": words(page), "tilt": tilt(page)}
+            )
     return result
+
+
+def tilt(page: pages.Page) -> float:
+    """How far the stored page's text lines are turned, in degrees; 0 where
+    pages.text_tilt finds none, or none worth turning."""
+    found = pages.text_tilt(page.image)
+    return 0.0 if found is None else float(np.degrees(found))
 
 
 def words(page: pages.Page) -> int:
@@ -76,6 +89,12 @@ class SamplesTest(unittest.TestCase):
                     [side["mode"] for side in got], [side["mode"] for side in expected]
                 )
                 for number, (now, then) in enumerate(zip(got, expected), 1):
+                    if "tilt" in now:
+                        self.assertLessEqual(
+                            abs(now["tilt"]),
+                            LEVEL_DEGREES,
+                            f"side {number}: its text is not level",
+                        )
                     if "words" in then:
                         self.assertGreaterEqual(
                             now["words"],
@@ -87,7 +106,10 @@ class SamplesTest(unittest.TestCase):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--record"]:
         for name in sys.argv[2:]:
-            result = outcome(SAMPLES / name)
+            result = [  # level is required of every page, not recorded
+                {k: v for k, v in side.items() if k != "tilt"}
+                for side in outcome(SAMPLES / name)
+            ]
             (SAMPLES / name / EXPECTED).write_text(
                 "# what became of each side, checked by eye\n"
                 + tomli_w.dumps({"side": result})

@@ -8,7 +8,7 @@
 #   RELEASE=1         refuse to finish without a Developer ID identity and notarization
 #   PYTHON            Python 3.13 to build with (default: Homebrew's python3.13)
 #
-# Needs SANE built into sane-prefix/ and Tesseract from Homebrew (see README).
+# Needs SANE built into sane-prefix/ and Tesseract from Homebrew (see docs/DEVELOPMENT.md).
 # Python dependencies are wheels pinned by hash in requirements*.txt; nothing
 # is built from source.
 set -eu
@@ -23,7 +23,7 @@ SPARKLE_ACCOUNT=open-scansnap  # Keychain account of the update-signing key
 CACHE=build/cache
 
 for need in sane-prefix/bin/scanimage "$(brew --prefix tesseract)/bin/tesseract" "$PYTHON"; do
-  [ -x "$need" ] || { echo "$need not found; see README (Install)." >&2; exit 1; }
+  [ -x "$need" ] || { echo "$need not found; see docs/DEVELOPMENT.md (Install)." >&2; exit 1; }
 done
 
 rm -rf "$B"
@@ -69,8 +69,12 @@ fi
 
 TESSERACT_PREFIX=$(brew --prefix tesseract)
 LICENSES=$PWD/$B/Licenses
+# the app runs on Python (CPython: python/ holds the packages, and macOS
+# folder names ignore case) and PyInstaller's bootloader, and carries both
+PYTHON_LICENSE=$("$VPY" -c 'import sysconfig; print(sysconfig.get_path("stdlib") + "/LICENSE.txt")')
 "$VPY" packaging/macos/licenses.py "$LICENSES" --other "Sparkle=$SPARKLE/LICENSE" \
-  --other "tessdata_fast=$LANGUAGE_DIR/LICENSE" \
+  --other "tessdata_fast=$LANGUAGE_DIR/LICENSE" --other "CPython=$PYTHON_LICENSE" \
+  --python pyinstaller \
   sane-prefix/bin/scanimage sane-prefix/lib/libsane.1.dylib \
   sane-prefix/lib/sane/libsane-fujitsu.1.so "$TESSERACT_PREFIX/bin/tesseract"
 ICON=$PWD/$B/$APP_NAME.icns
@@ -94,10 +98,25 @@ codesign --verify --deep --strict "$APP"
 "$APP/Contents/Frameworks/sane-prefix/bin/scanimage" -V >/dev/null
 "$APP/Contents/MacOS/$APP_NAME" --self-test
 
-mkdir -p "$B/dmg"
-cp -R "$APP" "$B/dmg/"
-ln -s /Applications "$B/dmg/Applications"
-hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$B/dmg" -format UDZO "$DMG"
+# The disk image: the app, an arrow, then the Applications folder
+# (dmgbuild, in its own environment; its sync call through dmg-tools/sync)
+"$PYTHON" -m venv "$B/dmg-venv"
+DMG_PY=$B/dmg-venv/bin/python
+"$DMG_PY" -m pip install -q --require-hashes --only-binary :all: \
+  -r packaging/macos/dmg-requirements.txt
+BACKGROUND=$PWD/$B/dmg-background.tiff
+"$VPY" packaging/macos/dmg_background.py "$BACKGROUND"
+PATH="$PWD/packaging/macos/dmg-tools:$B/dmg-venv/bin:$PATH" \
+  "$B/dmg-venv/bin/dmgbuild" -s packaging/macos/dmg_settings.py \
+  -D "app=$APP" -D "background=$BACKGROUND" "$APP_NAME" "$DMG" >/dev/null
+VOLUME=$(mktemp -d)
+hdiutil attach "$DMG" -readonly -nobrowse -noautoopen -mountpoint "$VOLUME" -quiet
+if ! "$DMG_PY" packaging/macos/check_dmg_layout.py "$VOLUME" "$APP_NAME.app" \
+  || ! codesign --verify --deep --strict "$VOLUME/$APP_NAME.app"; then
+  hdiutil detach "$VOLUME" -quiet
+  exit 1
+fi
+hdiutil detach "$VOLUME" -quiet
 
 if [ "$SIGNING_IDENTITY" != - ]; then
   codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$DMG"
@@ -122,6 +141,6 @@ cp "$APPCAST_DIR/appcast.xml" dist/appcast.xml
 # Leave only the image: macOS mixes up apps with several copies installed
 # (TN3179, FB15568200), and LaunchServices registers these build copies.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-"$LSREGISTER" -u "$APP" "$B/dmg/$APP_NAME.app" 2>/dev/null || true
-rm -rf "$B/dist" "$B/dmg"
+"$LSREGISTER" -u "$APP" 2>/dev/null || true
+rm -rf "$B/dist"
 echo "$DMG"

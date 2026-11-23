@@ -4,18 +4,22 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import pikepdf
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from skimage.color import lab2rgb
 
-from openscansnap import config, pages, pdf, sheet
+from openscansnap import bundle, config, pages, pdf, sheet
 from openscansnap.pages import Mode
 
 DPI = 300
-OPTIONS = config.default_options()
+OPTIONS = replace(
+    config.default_options(), language="eng"
+)  # one language: pages.prepare
 SCALE = OPTIONS.lineart_dpi // DPI  # black and white is stored at this multiple
 LETTER = (2550, 3300)  # 8.5 x 11 inches
 TEXT = [
@@ -103,11 +107,93 @@ class PrepareTest(unittest.TestCase):
     def test_black_print_is_not_color(self):
         self.assertFalse(pages.has_colored_ink(text_page(), DPI))
 
+    def test_a_lone_pen_drawing_is_not_blank(self):
+        # a doodle on a back: a thin blue line, no text, far under PICTURE_SHARE
+        page = paper()
+        ImageDraw.Draw(page).line(
+            (1300, 400, 1300, 2600), fill=(110, 130, 210), width=5
+        )  # as light as a real one measured: contrast 0.47
+        contrast, share = pages.side_contrast(page, DPI)
+        self.assertLess(contrast, pages.INK)  # faint: decided by the faint rule
+        self.assertLess(share, pages.PICTURE_SHARE)
+        kept = pages.prepare(page, DPI, OPTIONS)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept.mode, Mode.COLOR)
+
     def test_a_pen_stroke_makes_the_page_color(self):
         page = text_page()
         ImageDraw.Draw(page).line((300, 2900, 1500, 2950), fill=(40, 70, 200), width=8)
         self.assertTrue(pages.has_colored_ink(page, DPI))
         self.assertEqual(pages.prepare(page, DPI, OPTIONS).mode, Mode.COLOR)
+
+    def test_ink_is_color_from_the_chroma_of_a_navy_letterhead(self):
+        # measured: black print at most 7.9, a navy letterhead 12.5 to 14
+        for chroma, colored in ((7.9, False), (12.5, True)):
+            with self.subTest(chroma=chroma):
+                page = text_page()
+                ink = tuple(
+                    round(v * 255) for v in lab2rgb([[[30.0, 0.0, -chroma]]])[0][0]
+                )
+                ImageDraw.Draw(page).rectangle((300, 2700, 900, 2900), fill=ink)
+                self.assertEqual(pages.has_colored_ink(page, DPI), colored)
+
+    def test_color_strips_at_the_paper_edge_are_not_color(self):
+        # a printer's calibration strips: 0.5 mm wide, 4.5 mm long, at the edge
+        page = text_page()
+        draw = ImageDraw.Draw(page)
+        right = page.width - 3
+        for top, ink in ((1600, (230, 200, 40)), (1700, (216, 102, 102))):
+            draw.rectangle((right - 6, top, right, top + 54), fill=ink)
+        self.assertFalse(pages.has_colored_ink(page, DPI))
+
+    def test_a_color_page_is_put_on_white_paper(self):
+        # cream paper with the iX500's grain (measured 1-1.5 gray levels),
+        # darker toward one side (a shadow), with print and a green logo
+        rng = np.random.default_rng(0)
+        cream = np.array([238.0, 232.0, 214.0])
+        shade = np.linspace(1.0, 0.96, LETTER[0])[np.newaxis, :, np.newaxis]
+        grain = rng.normal(0, 1.2, (LETTER[1], LETTER[0], 1))
+        page = Image.fromarray(np.clip(cream * shade + grain, 0, 255).astype(np.uint8))
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((300, 300, 700, 600), fill=(40, 110, 70))
+        draw.rectangle((300, 2850, 1500, 2950), fill=(250, 240, 120))  # highlighter
+        for line in range(20):
+            draw.rectangle(
+                (300, 900 + line * 90, 2200, 930 + line * 90), fill=(20, 20, 20)
+            )
+        white = np.asarray(pages.whitened(page))
+        self.assertGreaterEqual(white[150, 1200].min(), 250)  # paper, either side
+        self.assertGreaterEqual(white[150, 2400].min(), 250)
+        self.assertGreater(np.ptp(white[450, 500]), 30)  # the logo still green
+        self.assertGreater(np.ptp(white[2900, 600]), 30)  # the highlighter kept
+        self.assertLess(white[915, 1200].max(), 60)  # the print still black
+
+    def test_clean_up_puts_a_stored_color_page_on_white(self):
+        rng = np.random.default_rng(0)
+        cream = np.array([238.0, 232.0, 214.0])
+        grain = rng.normal(0, 1.2, (LETTER[1], LETTER[0], 1))
+        page = Image.fromarray(np.clip(cream + grain, 0, 255).astype(np.uint8))
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((300, 300, 700, 600), fill=(40, 110, 70))
+        for line in range(20):
+            draw.rectangle(
+                (300, 900 + line * 90, 2200, 930 + line * 90), fill=(20, 20, 20)
+            )
+        for clean_up in (True, False):
+            with self.subTest(clean_up=clean_up):
+                kept = pages.prepare(page, DPI, replace(OPTIONS, clean_up=clean_up), 0)
+                self.assertEqual(kept.mode, Mode.COLOR)
+                out = np.asarray(kept.image.convert("RGB"))
+                paper = out[
+                    out.shape[0] * 150 // LETTER[1], out.shape[1] * 1200 // LETTER[0]
+                ]
+                self.assertEqual(paper.min() >= 250, clean_up, paper)
+
+    def test_a_page_mostly_picture_is_not_whitened(self):
+        rng = np.random.default_rng(0)
+        picture = np.kron(rng.integers(150, 250, (33, 26, 3)), np.ones((100, 100, 1)))
+        page = Image.fromarray(picture[: LETTER[1], : LETTER[0]].astype(np.uint8))
+        self.assertIs(pages.whitened(page), page)
 
     def test_photo_without_text_stays_grayscale(self):
         rng = np.random.default_rng(0)
@@ -210,6 +296,25 @@ class BlankTest(unittest.TestCase):
         )
         self.assertIsNotNone(prepared)
         self.assertEqual(prepared.mode, Mode.GRAY)
+
+
+@unittest.skipUnless(bundle.leptonica(), "needs Leptonica")
+class TextTiltTest(unittest.TestCase):
+    @staticmethod
+    def turned(degrees: float) -> Image.Image:
+        return text_page().rotate(
+            degrees, resample=Image.Resampling.BICUBIC, fillcolor="white"
+        )
+
+    def test_text_lines_give_their_tilt(self):
+        for degrees in (1.0, -0.5, 5.0):
+            with self.subTest(degrees=degrees):
+                tilt = pages.text_tilt(self.turned(degrees))
+                self.assertAlmostEqual(np.degrees(tilt), degrees, delta=0.05)
+
+    def test_level_text_and_a_side_without_text_have_none(self):
+        self.assertIsNone(pages.text_tilt(self.turned(0.05)))
+        self.assertIsNone(pages.text_tilt(Image.new("RGB", LETTER, "white")))
 
 
 @unittest.skipUnless(

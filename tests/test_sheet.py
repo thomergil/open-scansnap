@@ -95,6 +95,72 @@ class SheetTest(unittest.TestCase):
             with self.subTest(side=side):
                 self.assertLessEqual(abs(edges[side].position - position), TOLERANCE_PX)
 
+    def test_text_turned_level_keeps_all_of_the_sheet(self):
+        # a sheet with dark marks in every corner: none may be cut off
+        sheet_image = Image.new("RGB", LETTER, (PAPER,) * 3)
+        draw = ImageDraw.Draw(sheet_image)
+        width, height = LETTER
+        for x, y in (
+            (0, 0),
+            (width - 40, 0),
+            (0, height - 40),
+            (width - 40, height - 40),
+        ):
+            draw.rectangle((x, y, x + 39, y + 39), fill=(INK,) * 3)
+        for degrees in (0.5, -2.0, 6.0):
+            with self.subTest(degrees=degrees):
+                level = sheet.turned_level(sheet_image, np.radians(degrees))
+                gray = np.asarray(level.convert("L"))
+                ink = (gray < (PAPER + INK) / 2).sum()
+                self.assertAlmostEqual(ink / (4 * 40 * 40), 1, delta=0.05)
+                # the corners the turn brings in are paper, not black
+                self.assertGreater(
+                    gray[0, 0] if degrees > 0 else gray[0, -1], PAPER - 3
+                )
+                self.assertGreater(level.width, width)
+
+    def test_a_wavy_edge_is_still_an_edge(self):
+        # the waviest real edge measured scattered 3.5 mm from its line; this
+        # one, waving 13 mm deep, scatters 3.6 mm
+        gray = sheet._gray(scan(page(False), 0.0))
+        depth = sheet.pixels(13.0, DPI)
+        for row in range(OFFSET[1], OFFSET[1] + LETTER[1]):
+            reach = round(depth * (1 + np.sin(row / 300)) / 2)
+            gray[row, : OFFSET[0] + reach] = BACKING
+        self.assertIsNotNone(sheet.find_edges(gray, DPI)["left"])
+
+    def test_text_turned_counterclockwise_is_turned_back(self):
+        tone = 225  # off-white paper: the corners brought in must match it
+        image = Image.new("RGB", LETTER, (tone,) * 3)
+        ImageDraw.Draw(image).rectangle((300, 1600, 2200, 1630), fill=(INK,) * 3)
+        for degrees in (3.0, -3.0):
+            with self.subTest(degrees=degrees):
+                askew = image.rotate(
+                    degrees, resample=Image.Resampling.BICUBIC, fillcolor=(tone,) * 3
+                )
+                level = sheet.turned_level(askew, np.radians(degrees))
+                gray = np.asarray(level.convert("L"))
+                rows = np.nonzero((gray < (tone + INK) / 2).any(axis=1))[0]
+                self.assertLess(rows.max() - rows.min(), 40)  # level again
+                self.assertAlmostEqual(int(gray[0, 0]), tone, delta=3)
+
+    def test_a_scan_without_edges_says_so(self):
+        found = sheet.straightened(scan(page(False), 1.5), DPI)[1]
+        blank = Image.new("RGB", LETTER, (PAPER,) * 3)
+        self.assertEqual((found, sheet.straightened(blank, DPI)[1]), (True, False))
+
+    def test_an_edge_whose_samples_scatter_is_not_an_edge(self):
+        # paper barely brighter than the backing: on each line, paper is first
+        # found at a random depth (10 mm scatter, as the failed edges measured)
+        rng = np.random.default_rng(0)
+        gray = np.full(FRAME[::-1], float(BACKING)) + rng.normal(0, NOISE, FRAME[::-1])
+        top, bottom = OFFSET[1], OFFSET[1] + LETTER[1]
+        for row in range(top, bottom):
+            gray[row, OFFSET[0] + rng.integers(0, 500) : OFFSET[0] + LETTER[0]] = PAPER
+        edges = sheet.find_edges(gray, DPI)
+        self.assertIsNone(edges["left"])
+        self.assertIsNotNone(edges["right"])
+
     def test_scan_without_backing_is_left_whole(self):
         # nothing to tell paper from: keep everything rather than cut
         blank = Image.new("RGB", LETTER, (PAPER,) * 3)

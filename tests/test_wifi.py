@@ -1,5 +1,5 @@
 """SANE's fujitsu backend over Wi-Fi, against the fake iX500 on localhost.
-Needs the patched SANE built into sane-prefix/ (see README)."""
+Needs the patched SANE built into sane-prefix/ (see docs/DEVELOPMENT.md)."""
 
 import argparse
 import contextlib
@@ -123,11 +123,15 @@ class WifiTest(unittest.TestCase):
 
     def test_wrong_hostid_is_reported(self):
         self.configure(HOSTID + 1)
-        with self.assertRaisesRegex(sane.ScanError, "refused the password or HostID"):
+        with self.assertRaisesRegex(
+            sane.ScanError, "refused this Mac or the scanner password"
+        ):
             self.sane_scan(Scanner(HOSTID, sheets=[(side(None), side(None))]))
 
     def test_wrong_password_is_reported(self):
-        with self.assertRaisesRegex(sane.ScanError, "refused the password or HostID"):
+        with self.assertRaisesRegex(
+            sane.ScanError, "refused this Mac or the scanner password"
+        ):
             self.sane_scan(
                 Scanner(HOSTID, password="9999", sheets=[(side(None), side(None))])
             )
@@ -384,7 +388,9 @@ class WifiTest(unittest.TestCase):
 
         def scan(device_name):
             batch = job.scan(config.default_options(), device_name)
-            return lambda: job.finish(batch, out_dir, config.default_options())
+            return lambda progress: job.finish(
+                batch, out_dir, config.default_options(), progress
+            )
 
         watcher = monitor.Monitor(
             connect,
@@ -456,13 +462,17 @@ class WifiTest(unittest.TestCase):
             try:
                 device = library.open(WIFI_DEVICE)
                 deadline = time.monotonic() + KEEP_ALIVE_WITHIN
-                while not scanner.keep_alives and time.monotonic() < deadline:
+                deadline += KEEP_ALIVE_WITHIN  # time for a second one
+                while len(scanner.keep_alives) < 2 and time.monotonic() < deadline:
                     device.read((monitor.SCAN_BUTTON, monitor.PAPER))
                     time.sleep(0.2)
+                holder = scanner.holder
                 device.close()
             finally:
                 library.exit()
-        self.assertGreater(scanner.keep_alives, 0)
+        # again and again, for the reservation held
+        self.assertGreaterEqual(len(scanner.keep_alives), 2)
+        self.assertEqual(set(scanner.keep_alives), {holder})
 
     def test_scanner_held_by_another_app_shows_as_busy(self):
         watcher = self.watch(Scanner(HOSTID, holder=b"\x01" * 6), Path(self.tmp.name))
@@ -474,7 +484,8 @@ class WifiTest(unittest.TestCase):
         with (
             FakeIX500(scanner),
             mock.patch.object(sane, "CONFIG_DIR", self.config),
-            mock.patch.object(job, "assemble", return_value=None),  # no OCR needed
+            # every side blank: no OCR needed
+            mock.patch.object(job, "assemble", return_value=job.Assembled([], "", [])),
             self.assertRaisesRegex(sane.ScanError, "blank"),
         ):
             job.run(

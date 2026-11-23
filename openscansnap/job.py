@@ -6,19 +6,21 @@ and, once sheets have gone through the scanner, where their sides are.
 """
 
 import logging
+import math
 import os
 import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ocrmypdf.exceptions import ExitCodeException
 from PIL import Image
 
-from . import pages, pdf, sane, sheet, showthrough
-from .options import Options
+from . import languages, pages, pdf, sane, sheet, showthrough
+from .options import LANGUAGE_SEPARATOR, Options, ScanMode
 
 OUTPUT_NAME = "scan_%Y-%m-%d_%H%M%S"
 PDF_SUFFIX = ".pdf"
@@ -26,12 +28,48 @@ OUTPUT_MODE = 0o644
 SIDES_PREFIX = "openscansnap-sides-"
 SIDES_PER_SHEET = 2  # sane.SCAN_OPTIONS scans both sides of every sheet
 FULL_TURN = 360  # degrees
+# SideResult.method of a side not stored: dropped as blank, or left out
+# because its choice was LEAVE_OUT
+BLANK, LEFT_OUT = "blank", "left out"
 
 log = logging.getLogger(__name__)
 
 
+# A side's own choice, instead of the scan's mode: a ScanMode, or LEAVE_OUT
+# (its result's method is then LEFT_OUT)
+LEAVE_OUT = "leave-out"
+Choice = ScanMode | str
+
+
+@dataclass(frozen=True)
+class SideResult:
+    """What became of one side."""
+
+    number: int  # its place in the scan, from 1
+    mode: pages.Mode | None  # how its page is stored; None: left out
+    method: str  # why: how it was read, "blank", or "left out"
+    page: Path | None  # its page, as the PDF stores it; None: left out
+
+
+@dataclass(frozen=True)
+class Assembled:
+    """A batch's pages, ready to become its PDF."""
+
+    pages: list[Path]  # in order
+    languages: str  # every language read, joined by LANGUAGE_SEPARATOR
+    sides: list[SideResult]  # one per side, in order
+
+
 class Cancelled(sane.ScanError):
     """The user stopped the scan (Ctrl-C) after sheets went through."""
+
+
+class PdfSaved(sane.ScanError):
+    """The PDF at path is saved, but what was to follow it failed."""
+
+    def __init__(self, message: str, path: Path):
+        super().__init__(message)
+        self.path = path
 
 
 @dataclass(frozen=True)
@@ -60,7 +98,9 @@ def scan(options: Options, device_name: str, keep_raw: Path | None = None) -> Ba
     """The scanner's part: every sheet in the feeder, as raw sides. Checks
     first that the PDF can be made with options' language, before any paper
     moves."""
-    missing = pages.missing_languages(options.languages)
+    # Automatic falls back to languages.FALLBACK where it cannot tell
+    wanted = [languages.FALLBACK] if options.automatic_language else options.languages
+    missing = pages.missing_languages(wanted)
     if missing:
         raise sane.ScanError(
             f"Tesseract language data missing: {', '.join(missing)}; "
@@ -85,12 +125,40 @@ def scan(options: Options, device_name: str, keep_raw: Path | None = None) -> Ba
     return Batch(stem, sides_dir, sides, stopped)
 
 
-def finish(batch: Batch, out_dir: Path, options: Options) -> Path:
-    """The rest, which needs no scanner: the batch's PDF in out_dir."""
+# Told, as each sheet is begun, its number (from 1) and the batch's sheets
+Progress = Callable[[int, int], None]
+
+
+def finish(
+    batch: Batch,
+    out_dir: Path,
+    options: Options,
+    progress: Progress | None = None,
+    keep: Callable[[Path, Assembled, Batch, Options], None] | None = None,
+) -> Path:
+    """The rest, which needs no scanner: the batch's PDF in out_dir. keep, if
+    given, is handed the PDF, its pages, the batch and options once the PDF
+    is written, while the sides and pages still exist (review.Store.keep); a
+    failure there is logged, the PDF stands. A batch whose scanning stopped
+    partway raises PdfSaved: its PDF holds the sides scanned before."""
     stem, sides_dir, stopped = batch.stem, batch.sides_dir, batch.stopped
+    path = None
     try:
         with tempfile.TemporaryDirectory() as pages_dir:
-            path = assemble(batch.sides, Path(pages_dir), out_dir, stem, options)
+            assembled = assemble(batch.sides, Path(pages_dir), options, progress)
+            if assembled.pages:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                path = claim_path(out_dir, stem)
+                try:
+                    write_pdf(assembled, path, options)
+                except BaseException:
+                    path.unlink()
+                    raise
+                if keep is not None:
+                    try:
+                        keep(path, assembled, batch, options)
+                    except Exception:
+                        log.exception("cannot keep the scan for review")
     except KeyboardInterrupt:
         kept = keep_sides(sides_dir, out_dir, stem)
         raise Cancelled(f"Cancelled; the scanned sides are in {kept}") from None
@@ -104,10 +172,16 @@ def finish(batch: Batch, out_dir: Path, options: Options) -> Path:
     if path is None:
         raise stopped or sane.ScanError("Every side was blank; nothing saved")
     if stopped:
-        raise sane.ScanError(
-            f"{stopped}; saved the sides scanned before that in {path}"
+        raise PdfSaved(
+            f"{stopped}; saved the sides scanned before that in {path}", path
         )
     return path
+
+
+def write_pdf(assembled: Assembled, path: Path, options: Options) -> None:
+    """The PDF of assembled's pages at path, its text read in every language
+    the pages were read in."""
+    pdf.write(assembled.pages, path, replace(options, language=assembled.languages))
 
 
 def describe(error: Exception) -> str:
@@ -128,26 +202,41 @@ def describe(error: Exception) -> str:
 
 
 def assemble(
-    sides: list[Path], pages_dir: Path, out_dir: Path, stem: str, options: Options
-) -> Path | None:
-    """Prepare each side, drop the blank ones and write the PDF; None when
-    every side is blank. The sides come front, back, front, back (duplex);
-    each sheet's two sides are cropped, cleaned of each other's show-through
-    and turned upright together, as far as options ask. Each page goes to
-    pages_dir as soon as it is ready, so a long batch does not pile up in
-    memory."""
-    options = options.in_effect()
-    saved = []
+    sides: list[Path],
+    pages_dir: Path,
+    options: Options,
+    progress: Progress | None = None,
+    choices: Mapping[int, Choice] | None = None,
+) -> Assembled:
+    """Prepare each side into pages_dir, dropping the blank ones. The sides
+    come front, back, front, back (duplex); each sheet's two sides are
+    cropped, cleaned of each other's show-through and turned upright
+    together, as far as options ask. Each page goes to pages_dir as soon as
+    it is ready, so a long batch does not pile up in memory. choices maps a
+    side's number to its own choice: stored in that ScanMode (and kept
+    though blank), or LEAVE_OUT."""
+    choices = choices or {}
+    settings, options = options, options.in_effect()  # per side: its own mode's
+    saved, results = [], []
+    read_in: dict[str, None] = {}  # the languages of the pages saved, in order
+    installed = (
+        set(pages.installed_languages()) if options.automatic_language else set()
+    )
+    sheets = math.ceil(len(sides) / SIDES_PER_SHEET)
     for first in range(0, len(sides), SIDES_PER_SHEET):
+        if progress is not None:
+            progress(first // SIDES_PER_SHEET + 1, sheets)
         sheet_sides = sides[first : first + SIDES_PER_SHEET]
         dpi = resolution(sheet_sides[0])
-        images = []
+        images, by_edges = [], []
         for side in sheet_sides:
             with Image.open(side) as image:
                 image = image.convert("RGB")
+                straight = False
                 if options.straighten:
-                    image = sheet.straighten_and_crop(image, dpi)
+                    image, straight = sheet.straightened(image, dpi)
                 images.append(image)
+                by_edges.append(straight)
         turns = [None] * len(images)
         if len(images) == SIDES_PER_SHEET:
             front, back = images
@@ -156,36 +245,96 @@ def assemble(
                     showthrough.clean(front, back, dpi),
                     showthrough.clean(back, front, dpi),
                 ]
-            if options.upright:
-                turns = sheet_turns(images, dpi, options.language)
-        for number, (image, turn) in enumerate(zip(images, turns), first + 1):
-            saved.extend(prepare_side(image, dpi, options, pages_dir, number, turn))
-    if not saved:
-        return None
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = claim_path(out_dir, stem)
+        # a side its edges could not straighten is turned by its text, as its
+        # own mode allows, when the scan straightens (As scanned keeps every
+        # side whole, whatever its choice): after show-through, which needs
+        # both sides as the paper has them, so the other side's print no
+        # longer reads as lines of text
+        images = [
+            image
+            if straight
+            or not options.straighten
+            or not side_options(settings, choices.get(number)).level_text
+            else level_text(image)
+            for number, image, straight in zip(
+                range(first + 1, first + 1 + len(images)), images, by_edges
+            )
+        ]
+        detections = [pages.Detection(image, dpi) for image in images]
+        side_languages = [language_of(side, options, installed) for side in detections]
+        if options.upright and len(images) == SIDES_PER_SHEET:
+            turns = sheet_turns(detections, side_languages)
+        elif options.upright:  # one side: turned here, from its own detection
+            turns = [pages.orientation(detections[0], side_languages[0]) or 0]
+        for number, (image, turn, language) in enumerate(
+            zip(images, turns, side_languages), first + 1
+        ):
+            choice = choices.get(number)
+            if choice == LEAVE_OUT:
+                log.info("side %d: left out, as chosen", number)
+                results.append(SideResult(number, None, LEFT_OUT, None))
+                continue
+            chosen = replace(side_options(settings, choice), language=language)
+            result = prepare_side(image, dpi, chosen, pages_dir, number, turn)
+            results.append(result)
+            if result.page is not None:
+                saved.append(result.page)
+                read_in.update(dict.fromkeys(language.split(LANGUAGE_SEPARATOR)))
+    return Assembled(saved, LANGUAGE_SEPARATOR.join(read_in), results)
+
+
+def side_options(settings: Options, choice: Choice | None) -> Options:
+    """The options a side is stored with: the scan's, or its own choice's
+    mode (a side given a mode is kept though blank)."""
+    if choice is None or choice == LEAVE_OUT:
+        return settings
+    return replace(settings, mode=ScanMode(choice), remove_blank=False)
+
+
+def level_text(side: Image.Image) -> Image.Image:
+    """side with its text turned level when it is measurably askew
+    (pages.text_tilt); as it is when that cannot be measured."""
     try:
-        pdf.write(saved, path, options)
-    except BaseException:
-        path.unlink()
-        raise
-    return path
+        tilt = pages.text_tilt(side)
+    except sane.ScanError as e:  # levelling is a refinement: the page stands
+        log.warning("text tilt not measured: %s", e)
+        return side
+    if tilt is None:
+        return side
+    log.debug("text tilt %.2f degrees, turned level", math.degrees(tilt))
+    return sheet.turned_level(side, tilt)
 
 
 def resolution(side: Path) -> int:
     with Image.open(side) as image:
         if "dpi" not in image.info:
             raise sane.ScanError(
-                f"{side.name} has no resolution; rebuild SANE (see README)"
+                f"{side.name} has no resolution; rebuild SANE (see docs/DEVELOPMENT.md)"
             )
         return round(image.info["dpi"][0])
 
 
-def sheet_turns(sides: list[Image.Image], dpi: int, language: str) -> list[int]:
-    """The turn that makes each side of a sheet upright. A side without text
-    turns as the sheet does: its other side's turn, which the back sees
-    mirrored (a quarter turn one way shows as a quarter turn the other)."""
-    front, back = (pages.orientation(side, dpi, language) for side in sides)
+def language_of(side: pages.Detection, options: Options, installed: set[str]) -> str:
+    """The Tesseract language(s) a side is read in: detected among installed
+    when Automatic (languages.py), else the chosen ones."""
+    if not options.automatic_language:
+        return options.language
+    if not pages.has_ink(side.image, side.dpi):  # blank: nothing to tell from
+        return languages.FALLBACK
+    found = languages.detect(side, installed)
+    log.debug("detected language %s", found)
+    return found
+
+
+def sheet_turns(sides: list[pages.Detection], side_languages: list[str]) -> list[int]:
+    """The turn that makes each side of a sheet upright, each read in its
+    language. A side without text turns as the sheet does: its other side's
+    turn, which the back sees mirrored (a quarter turn one way shows as a
+    quarter turn the other)."""
+    front, back = (
+        pages.orientation(side, language)
+        for side, language in zip(sides, side_languages)
+    )
     if front is None and back is not None:
         front = -back % FULL_TURN
     elif back is None and front is not None:
@@ -200,12 +349,12 @@ def prepare_side(
     pages_dir: Path,
     number: int,
     turn: int | None,
-) -> list[Path]:
-    """The side's saved page, or nothing when it is blank."""
+) -> SideResult:
+    """The side's page, saved to pages_dir, or none when it is blank."""
     page = pages.prepare(image, dpi, options, turn)
     if page is None:
         log.info("side %d: blank, dropped", number)
-        return []
+        return SideResult(number, None, BLANK, None)
     log.info(
         "side %d: %s (%s, %.0f words read)",
         number,
@@ -213,7 +362,9 @@ def prepare_side(
         page.method,
         page.readable_words,
     )
-    return [pdf.save_page(page, pages_dir, number)]
+    return SideResult(
+        number, page.mode, page.method, pdf.save_page(page, pages_dir, number)
+    )
 
 
 def keep_sides(sides_dir: Path, out_dir: Path, stem: str) -> Path:

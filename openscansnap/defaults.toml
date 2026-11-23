@@ -25,14 +25,19 @@ upright = true
 remove_blank = true
 # Paint out the other side's print where it shows through the paper.
 remove_show_through = true
-# Clear creases, shadows and marks at the paper edge.
+# Clear creases, shadows and marks at the paper edge, and put color and gray
+# pages that are mostly paper on white paper.
 clean_up = true
 # Add a text layer so the PDF can be searched.
 searchable = true
-# Tesseract language(s) for the text layer, e.g. "eng+nld". Each needs its
-# Tesseract data (brew install tesseract-lang).
-language = "eng"
+# The text's language, for the text layer and for turning pages upright:
+# "auto" (each page's own, detected), or Tesseract language(s), e.g.
+# "eng+nld". Each needs its Tesseract data; the app bundles the languages
+# of packaging/macos/languages.txt and English.
+language = "auto"
 
 [window]
 # Show the scan window when paper is put in the feeder.
 show_when_paper_loaded = true
+# Open the review window (each page, and how it is stored) after each scan.
+review_after_scan = true

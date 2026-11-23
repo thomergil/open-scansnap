@@ -1,7 +1,7 @@
 """SANE configuration and scanning through the patched fujitsu backend.
 
 The backend in sane-backends/ (branch vens) is built into sane-prefix/; see
-the README. Its configuration lives in CONFIG_DIR, not in the build tree.
+docs/DEVELOPMENT.md. Its configuration lives in CONFIG_DIR, not in the build tree.
 """
 
 import ipaddress
@@ -51,8 +51,6 @@ SCAN_OPTIONS = [
     "Color",
     "--format=tiff",
 ]
-# The configuration holds the scanner's credentials: owner only.
-PRIVATE_DIR, PRIVATE_FILE = 0o700, 0o600
 HOSTID_MAX = 2**64 - 1
 PASSWORD_MAX = 16  # characters; the backend's VENS_PASSWORD_MAX
 # scanimage cancels the scan on Ctrl-C (SIGINT reaches it too), ends the
@@ -61,7 +59,10 @@ CANCEL_WAIT = 10  # seconds
 # scanimage's messages (sane_strstatus) for the failures a user can fix
 BUSY = "Device busy"
 REFUSED = "Access to resource has been denied"
-REFUSED_MESSAGE = "Scanner refused the password or HostID"
+REFUSED_MESSAGE = "Scanner refused this Mac or the scanner password"
+BUSY_MESSAGE = (
+    "Scanner busy: quit ScanSnap Home and its menu bar item, or wait a minute"
+)
 
 
 class ScanError(Exception):
@@ -80,6 +81,10 @@ class NotFound(NotSetUp):
 
 class Refused(ScanError):
     """The scanner refused the password or the HostID."""
+
+
+class Busy(ScanError):
+    """Another program is using the scanner."""
 
 
 class BadConfiguration(ScanError):
@@ -140,8 +145,7 @@ def write_config(scanner: Scanner | None) -> Path:
     """Write the SANE configuration for this Wi-Fi scanner (None: for a
     scanner on USB only), readable by the owner only, and return its
     file."""
-    CONFIG_DIR.mkdir(mode=PRIVATE_DIR, parents=True, exist_ok=True)
-    CONFIG_DIR.chmod(PRIVATE_DIR)
+    files.private_dir(CONFIG_DIR)  # it holds the scanner's credentials
     lines = list(USB_LINES)
     if scanner is not None:
         lines.append(f"option wifi-hostid 0x{scanner.hostid:016x}")
@@ -151,8 +155,10 @@ def write_config(scanner: Scanner | None) -> Path:
             lines.append(f"# scanner {scanner.mac}")
         lines.append(f"wifi {scanner.host}")
     conf = CONFIG_DIR / f"{BACKEND}.conf"
-    files.replace_file(conf, ("\n".join(lines) + "\n").encode(), PRIVATE_FILE)
-    files.replace_file(CONFIG_DIR / "dll.conf", f"{BACKEND}\n".encode(), PRIVATE_FILE)
+    files.replace_file(conf, ("\n".join(lines) + "\n").encode(), files.PRIVATE_FILE)
+    files.replace_file(
+        CONFIG_DIR / "dll.conf", f"{BACKEND}\n".encode(), files.PRIVATE_FILE
+    )
     return conf
 
 
@@ -219,7 +225,9 @@ def scan(out_dir: Path, device_name: str) -> list[Path]:
     name) into out_dir; return the page files in order. Raises ScanStopped,
     with the complete sides, if scanning fails after some sides."""
     if not SCANIMAGE.exists():
-        raise ScanError(f"{SCANIMAGE} not found; build SANE first (see README)")
+        raise ScanError(
+            f"{SCANIMAGE} not found; build SANE first (see docs/DEVELOPMENT.md)"
+        )
     process = subprocess.Popen(
         [
             str(SCANIMAGE),
@@ -249,9 +257,9 @@ def scan(out_dir: Path, device_name: str) -> list[Path]:
     if process.returncode in (0, EXIT_NO_DOCS):
         return pages
     if BUSY in stderr:
-        message = (
-            "Scanner busy: quit ScanSnap Home and its menu bar item, or wait 30 seconds"
-        )
+        if not pages:
+            raise Busy(BUSY_MESSAGE)
+        message = BUSY_MESSAGE
     elif REFUSED in stderr:
         if not pages:
             raise Refused(REFUSED_MESSAGE)

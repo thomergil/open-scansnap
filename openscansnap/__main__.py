@@ -70,7 +70,9 @@ def connected_scanner() -> str:
         device.close()
         return device.name
     except saneapi.SaneError as e:
-        raise sane.ScanError(f"Scanner not available: {e}") from e
+        raise monitor.connection_error(e) or sane.ScanError(
+            f"Scanner not available: {e}"
+        ) from e
     finally:
         connector.exit()
 
@@ -114,7 +116,8 @@ def main() -> None:
     )
     c.add_argument(
         "--language",
-        help="Tesseract language(s), e.g. eng+nld (default: scan.language setting)",
+        help="auto (each page's, detected), or Tesseract language(s), e.g. eng+nld "
+        "(default: scan.language setting)",
     )
     c.set_defaults(run=scan)
 
@@ -140,7 +143,7 @@ def main() -> None:
 # the app; the most specific class first
 REMEDIES = {
     sane.NotFound: "Turn the scanner on and check that it is on this Mac's "
-    "network, or pass --host with its IP address.",
+    "network, or run: python -m openscansnap setup --host <its IP address>",
     sane.NotSetUp: "Run: python -m openscansnap setup",
     sane.Refused: "If its password was changed, run: python -m openscansnap setup --password",
     sane.BadConfiguration: "Delete the file, or run: python -m openscansnap setup",

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from openscansnap import __main__ as cli
-from openscansnap import config, job, sane
+from openscansnap import config, job, sane, saneapi
 from openscansnap.options import Quality, ScanMode
 
 FILE = '[scan]\nmode = "color"\nlanguage = "eng+nld"\nsearchable = false\n'
@@ -88,12 +88,44 @@ class ScanFlagsTest(unittest.TestCase):
             self.scan(language="eng+")
 
 
+class ConnectedScannerTest(unittest.TestCase):
+    """The scanner to use, or why it cannot be used, as the app tells it."""
+
+    def connected(self, opened):
+        """connected_scanner, with opening the scanner giving opened (a
+        device), or raising it (an exception)."""
+        connector = mock.Mock(
+            side_effect=opened if isinstance(opened, Exception) else [opened]
+        )
+        with mock.patch.object(cli.monitor, "Connector", return_value=connector):
+            try:
+                return cli.connected_scanner()
+            finally:
+                connector.exit.assert_called_once()
+
+    def test_the_scanner_is_closed_for_scanimage(self):
+        device = mock.Mock()
+        device.name = sane.USB_DEVICE
+        self.assertEqual(self.connected(device), sane.USB_DEVICE)
+        device.close.assert_called_once()
+
+    def test_a_scanner_in_use_or_refusing_says_so(self):
+        for status, kind in (
+            (saneapi.DEVICE_BUSY, sane.Busy),
+            (saneapi.ACCESS_DENIED, sane.Refused),
+            (saneapi.IO_ERROR, sane.ScanError),
+        ):
+            with self.subTest(status=status), self.assertRaises(kind) as caught:
+                self.connected(saneapi.SaneError(status, "no"))
+            self.assertIs(type(caught.exception), kind)
+
+
 class RemedyTest(unittest.TestCase):
     """Problems whose fix differs in the app say the command line's."""
 
     def test_each_problem_says_its_command(self):
         for error, command in (
-            (sane.NotFound("No scanner found"), "--host"),
+            (sane.NotFound("No scanner found"), "setup --host"),
             (sane.NotSetUp("No scanner set up"), "openscansnap setup"),
             (sane.Refused("refused"), "setup --password"),
             (sane.BadConfiguration("fujitsu.conf: x"), "Delete the file"),

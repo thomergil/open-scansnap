@@ -2,9 +2,11 @@
 the macOS app that scripts/build-macos.sh makes.
 
 The app carries SANE (sane-prefix/, as built from sane-backends/) and
-Tesseract (tesseract/) beside the Python code, in the same layout.
+Tesseract (tesseract/, its libraries with the app's others) beside the
+Python code, in the same layout.
 """
 
+import ctypes.util
 import os
 import sys
 from pathlib import Path
@@ -24,6 +26,21 @@ LIBSANE = (
 # fujitsu backend is not where the build put it.
 SANE_BACKENDS = SANE_PREFIX / "lib" / "sane"
 TESSERACT = ROOT / "tesseract"
+# Leptonica, which Tesseract links: the app carries it beside its other
+# libraries; a checkout finds it through the system's library search
+# (ctypes.util.find_library)
+LEPTONICA = "leptonica"
+# its file name in the app, as Tesseract links it (major version 6); a
+# Leptonica that renames it fails the build's self-test
+LEPTONICA_IN_APP = ROOT / "libleptonica.6.dylib"
+
+
+def leptonica() -> Path | None:
+    """Where Leptonica's library is; None when it is not installed."""
+    if FROZEN:
+        return LEPTONICA_IN_APP if LEPTONICA_IN_APP.exists() else None
+    found = ctypes.util.find_library(LEPTONICA)
+    return Path(found) if found else None
 
 
 def sane_environment(config_dir: Path) -> dict[str, str]:

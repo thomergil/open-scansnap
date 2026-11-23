@@ -39,6 +39,9 @@ LANGUAGE_SEPARATOR = "+"  # Tesseract's: eng+nld
 LANGUAGE = re.compile(
     r"[A-Za-z0-9_/]+"
 )  # one Tesseract name: eng, chi_sim, script/Latin
+# The language setting for each side's language detected (languages.py),
+# instead of Tesseract names
+AUTOMATIC_LANGUAGE = "auto"
 
 
 def page_dpi(quality: Quality) -> int:
@@ -64,7 +67,7 @@ class Options:
     remove_show_through: bool
     clean_up: bool  # creases, shadows, marks at the paper edge
     searchable: bool  # a text layer, by OCR
-    language: str  # Tesseract's names, e.g. eng+nld
+    language: str  # Tesseract's names, e.g. eng+nld; or AUTOMATIC_LANGUAGE
 
     def __post_init__(self):
         """Raises ValueError for a choice no scan can have."""
@@ -74,15 +77,18 @@ class Options:
                 choices = ", ".join(member.value for member in kind)
                 raise ValueError(f"{name} must be one of {choices}, not {value!r}")
             object.__setattr__(self, name, kind(value))
-        if not all(LANGUAGE.fullmatch(name) for name in self.languages):
+        names = self.languages
+        automatic = AUTOMATIC_LANGUAGE in names
+        if (automatic and len(names) > 1) or not all(map(LANGUAGE.fullmatch, names)):
             raise ValueError(
-                "language must be Tesseract language names joined by "
-                f"{LANGUAGE_SEPARATOR!r}, e.g. eng{LANGUAGE_SEPARATOR}nld, not {self.language!r}"
+                f"language must be {AUTOMATIC_LANGUAGE!r} or Tesseract language "
+                f"names joined by {LANGUAGE_SEPARATOR!r}, e.g. "
+                f"eng{LANGUAGE_SEPARATOR}nld, not {self.language!r}"
             )
 
     def in_effect(self) -> "Options":
         """These options with the steps the mode rules out switched off:
-        a photo is not a document, and As Scanned changes nothing."""
+        a photo is not a document, and As scanned changes nothing."""
         if self.mode == ScanMode.PHOTO:
             return replace(
                 self, remove_blank=False, remove_show_through=False, clean_up=False
@@ -101,6 +107,18 @@ class Options:
     @property
     def languages(self) -> list[str]:
         return self.language.split(LANGUAGE_SEPARATOR)
+
+    @property
+    def automatic_language(self) -> bool:
+        """Whether each side's language is detected."""
+        return self.language == AUTOMATIC_LANGUAGE
+
+    @property
+    def level_text(self) -> bool:
+        """Whether a side its edges did not straighten is turned by its text:
+        when straightening is in effect, and not on a photo, whatever lines
+        are in it."""
+        return self.in_effect().straighten and self.mode != ScanMode.PHOTO
 
     @property
     def page_dpi(self) -> int:

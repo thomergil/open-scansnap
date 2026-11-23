@@ -3,8 +3,8 @@
 How the app works, how to build it, and how to run it from the command
 line. For using the app, see the [README](../README.md).
 
-Scan from a Fujitsu ScanSnap iX500 over Wi-Fi into an upright, searchable
-PDF, without ScanSnap Home: from a menu bar app (see The app below) or from
+Scan from a Fujitsu ScanSnap iX500, over Wi-Fi or USB, into an upright,
+searchable PDF without ScanSnap Home: from a menu bar app (see The app below) or from
 the command line. After Install and Set up below, run from the repository
 root:
 
@@ -22,20 +22,29 @@ Each step below runs as far as the scan's settings ask (see Settings).
 2. **`openscansnap.sheet`** finds the sheet in each side: its four edges,
    estimated every 0.7 mm along each edge and fitted with straight lines
    (the Theil-Sen estimator), give its tilt and its outline; the side is straightened and
-   cropped to them, whichever way the sheet went in.
+   cropped to them, whichever way the sheet went in. An edge whose estimates
+   scatter more than 6 mm from its line (`sheet.EDGE_SCATTER_MM`) is ignored.
 3. **`openscansnap.showthrough`** paints out the other side's print where it
    shows or bleeds through the paper: the scanner reads both sides, so the
-   other side is known (mirrored and aligned to this one).
+   other side is known (mirrored and aligned to this one). Then a side whose
+   edges could not be found is turned until its text is level (Leptonica's
+   `pixFindSkew`, through ctypes, measures the text's tilt), keeping all of
+   the page, except in Photo mode.
 4. **`openscansnap.pages`** decides, page by page, from measurements of
    that page:
    - drop the side if it is blank: nothing on it is clearly darker than the
      paper, or it has only faint marks that either Tesseract reads better
      mirrored (show-through from the other side) or, when they do not read
      as text, cover less than a fifth of the side;
+   - tell its language, when the text language is Automatic (Tesseract
+     names the script, py3langid the language);
    - turn it upright (Tesseract's orientation detection, kept only if the
      page then reads better);
    - keep color if any ink on it is colored (a pen stroke, a stamp: its
-     CIELAB chroma) or the page as a whole is colorful (a photo);
+     CIELAB chroma) or the page as a whole is colorful (a photo); a side
+     with colored ink is never left out as blank. A color or gray page that
+     is mostly paper is put on white paper (its tint and shading divided
+     out);
    - otherwise make it black and white with Otsu's threshold, on the page
      as scanned or with the paper's own shading (folds, uneven light)
      divided out first, whichever Tesseract reads best, and clear marks that touch
@@ -44,8 +53,7 @@ Each step below runs as far as the scan's settings ask (see Settings).
      grayscale. Black and white is stored at twice the resolution of color
      and gray, so letter edges stay smooth.
 5. **OCRmyPDF** adds the text layer. Black-and-white pages are stored
-   lossless: CCITT G4, or JBIG2 if `jbig2enc` is installed. Color and
-   grayscale pages are stored as JPEG.
+   lossless, as CCITT G4. Color and grayscale pages are stored as JPEG.
 
 If scanning fails partway through a batch, the PDF holds the sides scanned
 before the failure, and the message says so. If the PDF cannot be written,
@@ -57,7 +65,7 @@ have gone, or, if that folder cannot be written, in a temporary folder.
 
 ```sh
 brew install autoconf automake autoconf-archive libtool pkgconf libusb \
-    jpeg-turbo tesseract ghostscript poppler python@3.13
+    jpeg-turbo tesseract poppler python@3.13
 ```
 
 Build SANE into `sane-prefix/`. The Wi-Fi support is on the `vens` branch
@@ -91,15 +99,16 @@ python3.13 -m venv .venv
 
 ## Set up
 
-The scanner must be on your Wi-Fi network and paired with this Mac: it
-accepts only the computer it was paired with, known by its HostID.
-ScanSnap Home pairs it when it sets up the scanner's Wi-Fi.
+The scanner must be on your Wi-Fi network and allow this Mac: over Wi-Fi it
+accepts only the computers it allows, known by their HostIDs. ScanSnap Home
+does both when it sets up the scanner's Wi-Fi; so does the app's Set up
+Wi-Fi… with the scanner on USB.
 
 The app then needs nothing more. It searches the network for the scanner
 as ScanSnap Home does, uses this Mac's HostID as ScanSnap Home computes it,
 and finds the scanner again when its IP address changes. If you changed
 the scanner's password (by default the last 4 characters of its serial
-number), the menu offers Scanner Password… when the scanner refuses.
+number), the menu offers Scanner password… when the scanner refuses.
 
 From the command line, run:
 
@@ -133,10 +142,31 @@ scan.
 
 ## The app
 
-`scripts/build-macos.sh` builds `dist/Open ScanSnap.app`, signed, and a
-DMG. The app lives in the menu bar: its S shows a Wi-Fi mark while the
+`scripts/build-macos.sh` builds the app and `dist/OpenScanSnap-<version>.dmg`,
+signed with the login Keychain's Developer ID (else ad-hoc). A release build
+also notarizes and staples the image, and refuses to finish without both:
+
+```sh
+RELEASE=1 NOTARY_KEY_PATH=AuthKey.p8 NOTARY_KEY_ID=… NOTARY_ISSUER_ID=… \
+  scripts/build-macos.sh
+```
+
+The notary key is an App Store Connect API key of the Developer ID's team;
+keep it outside the repository, in a private (0600) file, and delete any
+temporary copy after the build. The update feed is signed with the Sparkle
+key in the login Keychain (account `open-scansnap`).
+
+The app lives in the menu bar: its S shows a Wi-Fi mark while the
 scanner is on. Press the scanner's Scan button, or choose Scan in the menu,
 and the PDF is made in the background while the next sheets are scanned.
+
+Once the PDF is made, the review window shows every scanned side and how it
+is stored, the blank ones left out included; Store as changes the selected
+sides, and Update PDF makes the PDF again in its place. The app keeps the
+latest scan for that, losslessly, in
+`~/Library/Application Support/open-scansnap/review`, and removes it when
+the next scan is kept; one whose PDF was deleted goes at the next scan or
+the next start (`openscansnap/review.py`).
 
 ## USB and Wi-Fi
 
@@ -162,20 +192,23 @@ The app's menu sets them; they are saved in
 documents.
 
 - **Scan mode**: Automatic (black and white, gray or color, whichever suits
-  each page), Black and White Document, Gray Document, Color Document,
+  each page), Black and white document, Gray document, Color document,
   Photo (color, without blank-page removal, show-through removal or
-  clean-up), or As Scanned (the scanner's image, uncropped and unturned).
+  clean-up), or As scanned (the scanner's image, uncropped and unturned).
 - **Quality**: Draft, Standard or High: color and gray pages at 150, 200 or
   300 dpi, black and white at twice that.
 - **Processing**: Straighten and crop to the sheet, Turn pages upright,
   Remove blank pages, Remove show-through, Clean up creases and shadows,
-  Make searchable, and the Text language. All are on by default.
+  Make searchable, each on by default; and the Text language, Automatic by
+  default.
+- Open this window after each scan: a checkbox in the review window itself,
+  on by default.
 - The scans folder, Show window when paper is loaded, and Debug mode, which
   keeps every scan's sides as the scanner sent them, in
   `~/Library/Logs/open-scansnap/raw`.
 
-The app comes with Tesseract's data for 36 languages, those of most
-scanned documents (`packaging/macos/languages.txt`). From the checkout,
+The app comes with Tesseract's data for the languages of most scanned
+documents (`packaging/macos/languages.txt`, and English). From the checkout,
 each text language needs its Tesseract data (`brew install
 tesseract-lang`); missing data is reported before any paper moves.
 
@@ -199,13 +232,8 @@ what they need is missing: the Wi-Fi tests need SANE built into
 
 ## Credits
 
-[bramheerink/scansnap](https://github.com/bramheerink/scansnap) first
-reverse-engineered the Wi-Fi protocol; this repository started as its
-clone. Built on [SANE](https://gitlab.com/sane-project/backends),
-[OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF),
-[Tesseract](https://github.com/tesseract-ocr/tesseract),
-[scikit-image](https://scikit-image.org/) and
-[img2pdf](https://gitlab.mister-muffin.de/josch/img2pdf).
+See the [README's Credits](../README.md#credits): who worked out the Wi-Fi
+protocol, and all the software the app is built on.
 
 ## License
 

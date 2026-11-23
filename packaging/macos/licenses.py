@@ -1,12 +1,15 @@
 """Collect the licenses of everything the macOS app bundles, and SANE's
 source changes, into one folder; run by scripts/build-macos.sh.
 
-    python packaging/macos/licenses.py OUT_DIR [--other NAME=LICENSE_FILE]... BINARY...
+    python packaging/macos/licenses.py OUT_DIR [--other NAME=LICENSE_FILE]...
+        [--python PACKAGE]... BINARY...
 
 BINARY: the native programs and libraries the app carries; the Homebrew
 libraries they load are found with otool and each one's license is copied
 from its Homebrew keg (or from packaging/macos/licenses/<formula>.txt when
-the keg has none). The Python packages are those in requirements.txt. A
+the keg has none). The Python packages are those in requirements.txt and
+those named with --python (PyInstaller, whose bootloader the app runs on);
+--other names any other component's license file (CPython's, Sparkle's). A
 component without a license stops the build.
 """
 
@@ -86,19 +89,24 @@ def copy_formula_license(formula: str, prefix: Path, out: Path) -> None:
         shutil.copy(f, target / f.name)
 
 
-def copy_python_licenses(out: Path) -> list[tuple[str, str]]:
-    """Copy the license of each package in requirements.txt; return
-    (name, license) pairs for the notice."""
+def copy_python_licenses(
+    out: Path, extra: list[str] | tuple[str, ...] = ()
+) -> list[tuple[str, str]]:
+    """Copy the license of each package in requirements.txt, and of the
+    extra ones the app carries though it does not import them (PyInstaller's
+    bootloader); return (name, license) pairs for the notice."""
     names = [
         m[1]
         for line in (ROOT / "requirements.txt").read_text().splitlines()
         if (m := REQUIREMENT.match(line))
-    ]
+    ] + list(extra)
     listed = []
     for name in names:
         try:
             dist = distribution(name)
-        except PackageNotFoundError:
+        except PackageNotFoundError as e:
+            if name in extra:  # named because the app carries it
+                raise MissingLicense(f"{name} is not installed") from e
             continue  # not for this platform
         meta = dist.metadata
         kind = meta.get("License-Expression") or next(
@@ -162,7 +170,12 @@ def sane_source(out: Path) -> str:
     return base
 
 
-def main(out: Path, binaries: list[Path], others: dict[str, Path]) -> None:
+def main(
+    out: Path,
+    binaries: list[Path],
+    others: dict[str, Path],
+    python_extra: list[str] | tuple[str, ...] = (),
+) -> None:
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -171,7 +184,7 @@ def main(out: Path, binaries: list[Path], others: dict[str, Path]) -> None:
     formulae = sorted(homebrew_formulae(binaries, prefix))
     for formula in formulae:
         copy_formula_license(formula, prefix, out / "homebrew")
-    python = copy_python_licenses(out / "python")
+    python = copy_python_licenses(out / "python", python_extra)
     for name, license_file in others.items():
         (out / name).mkdir()
         shutil.copy(license_file, out / name / license_file.name)
@@ -226,9 +239,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--other", action="append", default=[], help="NAME=LICENSE_FILE"
     )
+    parser.add_argument(
+        "--python",
+        action="append",
+        default=[],
+        help="a Python package the app carries beyond requirements.txt",
+    )
     args = parser.parse_args()
     main(
         args.out,
         args.binaries,
         {k: Path(v) for k, v in (o.split("=", 1) for o in args.other)},
+        args.python,
     )

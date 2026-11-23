@@ -101,7 +101,7 @@ class Scanner:
     residual: int | None = None  # report this residual instead of the true one
     oversize: int = 0  # bytes added to INQUIRY replies, beyond what was asked
     presses: int = 0  # scan button presses not yet reported
-    keep_alives: int = 0  # keep-alive packets received
+    keep_alives: list = field(default_factory=list)  # the MAC of each keep-alive
     opcodes: list[int] = field(default_factory=list)
     reads: list[tuple[int, int]] = field(default_factory=list)  # (sequence, window)
     rejected: list[int] = field(default_factory=list)
@@ -131,7 +131,7 @@ class Registration(socketserver.BaseRequestHandler):
             return
         if struct.unpack(">I", data[4:8])[0] == KEEP_ALIVE:
             with self.server.scanner.lock:
-                self.server.scanner.keep_alives += 1
+                self.server.scanner.keep_alives.append(data[12:18])  # its MAC
             return  # the reply (0x8001 at offset 4) is not needed by clients
         reply = bytearray(REPLY_LEN)
         reply[:4] = MAGIC

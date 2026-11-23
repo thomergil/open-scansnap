@@ -17,10 +17,12 @@ statistically, so nothing depends on its size or on which way it was fed:
    so stray points (a dog-ear) and a slightly wavy edge (a curled leading
    edge) do not pull it.
 
-The sheet's tilt (from its long sides, which run along the feed) straightens
-the scan; the lines found again on the straight scan give the crop. A side
-where too few lines find paper is not cropped: the result may keep some
-backing, but never loses paper.
+The sheet's tilt, from its left and right sides (they run along the feed),
+straightens the scan; the edges found again on the straightened scan give the
+crop. A side where too few sample lines find paper, or whose samples scatter
+more than EDGE_SCATTER_MM, is not cropped: the result may keep some backing,
+but never loses paper. A side whose edges give no tilt is turned level by
+its text later (turned_level), all of it kept.
 """
 
 import logging
@@ -53,6 +55,13 @@ QUANTIZATION_SIGMA = 1 / np.sqrt(12)
 # A side is an edge when paper is found on at least this share of its sample
 # lines: an edge runs along the sheet; fewer hits are specks, not paper.
 FOUND_SHARE = 0.5
+# A side is an edge when the median distance of its samples from the line
+# fitted through them is at most this. Measured on 736 edges of 27 iX500 scans
+# (2026-11-23): real edges at most 3.5 mm, the most on a wavy trailing edge;
+# where paper is barely brighter than the backing, samples find paper at
+# random depths, 10 mm and more (an off-white letter's left side: 18 mm, its
+# fitted line turned 2.3 degrees). The cutoff lies in that gap.
+EDGE_SCATTER_MM = 6.0
 SIDES = ("top", "bottom", "left", "right")
 
 
@@ -64,6 +73,13 @@ class Edge:
 
 def straighten_and_crop(image: Image.Image, dpi: int) -> Image.Image:
     """The sheet in a raw scan, straight and without backing."""
+    return straightened(image, dpi)[0]
+
+
+def straightened(image: Image.Image, dpi: int) -> tuple[Image.Image, bool]:
+    """straighten_and_crop's sheet, and whether its edges gave its tilt:
+    False when no side was found (paper barely brighter than the backing),
+    and the scan is returned as it came."""
     gray = _gray(image)
     edges = find_edges(gray, dpi)
     tilts = _tilts(edges)
@@ -88,8 +104,22 @@ def straighten_and_crop(image: Image.Image, dpi: int) -> Image.Image:
     log.debug("sheet: tilt %s, box %s", tilts, box)
     left, top, right, bottom = (round(v) for v in box)
     if right - left < 1 or bottom - top < 1:
-        return image
-    return image.crop((left, top, right, bottom))
+        return image, bool(tilts)
+    return image.crop((left, top, right, bottom)), bool(tilts)
+
+
+def turned_level(sheet: Image.Image, tilt: float) -> Image.Image:
+    """sheet with a tilt (radians, counterclockwise) undone, all of it kept:
+    the image grows by what the turn reaches past its old outline, and the
+    corners the turn brings in take the image's median tone per channel
+    (the paper's, on a page)."""
+    paper = tuple(round(float(np.median(band))) for band in sheet.split())
+    return sheet.rotate(
+        -float(np.degrees(tilt)),  # PIL turns counterclockwise
+        resample=Image.Resampling.BICUBIC,
+        expand=True,
+        fillcolor=paper if len(paper) > 1 else paper[0],
+    )
 
 
 def _tilts(edges: dict[str, "Edge | None"]) -> list[float]:
@@ -183,6 +213,9 @@ def _edge(
         lines,
         scatter,
     )
+    if scatter > pixels(EDGE_SCATTER_MM, dpi):
+        log.info("sheet: %s edge not found (its samples scatter)", side)
+        return None
     # back to the scan's coordinates; the tilt's sign follows the turn above
     position = {
         "top": depth,

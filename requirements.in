@@ -10,3 +10,4 @@ pypdfium2
 pyobjc-framework-ServiceManagement; sys_platform == "darwin"
 scipy
 psutil
+py3langid

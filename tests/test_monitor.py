@@ -27,8 +27,9 @@ class Harness:
     """One scanner timeline across connections: each reading is taken in
     turn and the last one repeats; an exception in it is raised instead.
     refuse makes every connection fail. Scans are recorded; scan_result,
-    if an exception, fails the scan itself, pdf_result the PDF after it;
-    making a PDF waits for pdf_gate."""
+    if an exception, fails the scan itself, pdf_result the PDF after it (a
+    list: each PDF's in turn); making a PDF waits for pdf_gate, and scanning
+    for scan_gate."""
 
     def __init__(
         self,
@@ -51,6 +52,9 @@ class Harness:
         self.pdf_result = pdf_result
         self.pdf_gate = threading.Event()
         self.pdf_gate.set()
+        self.scan_gate = threading.Event()
+        self.scan_gate.set()
+        self.scanning = threading.Event()  # set once a scan began
 
     def connect(self):
         if self.refuse:
@@ -68,18 +72,26 @@ class Harness:
     def scan(self, device_name):
         self.scanned_from.append(device_name)
         self.scans.append([connection.closed for connection in self.opened])
+        self.scanning.set()
+        self.scan_gate.wait()
         if isinstance(self.scan_result, Exception):
             raise self.scan_result
         return self.make_pdf
 
-    def make_pdf(self):
+    def make_pdf(self, progress):
+        progress(1, 1)
         self.pdf_gate.wait()
-        if isinstance(self.pdf_result, Exception):
-            raise self.pdf_result
-        return self.pdf_result
+        result = self.pdf_result
+        if isinstance(result, list):
+            result = result.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class Connection:
+    unreadable = ()  # options whose reading fails
+
     def __init__(self, harness: Harness):
         self.harness = harness
         self.name = harness.device_name
@@ -101,6 +113,8 @@ class Connection:
         )
 
     def read_text(self, name):
+        if name in self.unreadable:
+            raise saneapi.SaneError(saneapi.IO_ERROR, f"cannot read {name}")
         if name == monitor.PAIRED_HOSTIDS:
             return self.harness.paired
         if name == monitor.MODEL_NAME:
@@ -186,7 +200,7 @@ class MonitorTest(unittest.TestCase):
         network = monitor.Network("office", "WPA2", "AES", -40)
 
         def set_up(device):
-            monitor.set_up_wifi(device, network, "pass phrase")
+            monitor.set_up_wifi(device, network, "pass phrase", others_warned=True)
             watcher.refresh_wifi(device)
 
         watcher.run_on_scanner(set_up).result(SECONDS)
@@ -202,9 +216,74 @@ class MonitorTest(unittest.TestCase):
         self.wait_for(watcher, lambda s: s.wifi is not None)
         network = monitor.Network("office", "WPA2", "AES", -40)
         watcher.run_on_scanner(
-            lambda device: monitor.set_up_wifi(device, network, "pass phrase")
+            lambda device: monitor.set_up_wifi(
+                device, network, "pass phrase", others_warned=False
+            )
         ).result(SECONDS)
         self.assertEqual(harness.paired, both)  # the other computer kept
+
+    def test_wi_fi_set_up_changes_nothing_unless_told_what_it_forgets(self):
+        network = monitor.Network("office", "WPA2", "AES", -40)
+        other = "0011223344550000"
+        for unreadable, others_warned in (
+            ((), False),  # another computer is allowed: not told
+            ((monitor.PAIRED_HOSTIDS,), True),  # who is allowed: not known
+        ):
+            with self.subTest(unreadable=unreadable):
+                harness = Harness([PAPER])
+                harness.device_name, harness.paired = sane.USB_DEVICE, other
+                with mock.patch.object(Connection, "unreadable", unreadable):
+                    watcher = self.watch(harness)
+                    self.wait_for(watcher, lambda s: s.wifi is not None)
+                    future = watcher.run_on_scanner(
+                        lambda device, warned=others_warned: monitor.set_up_wifi(
+                            device, network, "pass phrase", others_warned=warned
+                        )
+                    )
+                    with self.assertRaisesRegex(sane.ScanError, "nothing was changed"):
+                        future.result(SECONDS)
+                self.assertEqual(harness.joined, [])
+                self.assertEqual(harness.paired, other)
+
+    def test_wi_fi_set_up_sends_no_password_that_does_not_fit(self):
+        harness = Harness([PAPER])
+        harness.device_name = sane.USB_DEVICE
+        watcher = self.watch(harness)
+        self.wait_for(watcher, lambda s: s.wifi is not None)
+        network = monitor.Network("office", "WPA2", "AES", -40)
+        future = watcher.run_on_scanner(
+            lambda device: monitor.set_up_wifi(
+                device, network, "short", others_warned=True
+            )
+        )
+        with self.assertRaisesRegex(sane.ScanError, "8 to 63"):
+            future.result(SECONDS)
+        self.assertEqual(harness.joined, [])
+
+    def test_passwords_that_networks_take(self):
+        wpa = monitor.Network("n", "WPA2", "AES", 0)
+        wep = monitor.Network("n", "WEP", "WEP", 0)
+        open_network = monitor.Network("n", "OPEN", "NONE", 0)
+        for network, password, fits in (
+            (open_network, "", True),
+            (wpa, "eight ch", True),
+            (wpa, "x" * 63, True),
+            (wpa, "f" * 64, True),  # hexadecimal
+            (wpa, "seven c", False),
+            (wpa, "g" * 64, False),  # 64, not hexadecimal
+            (wpa, "caf\u00e9 au lait", False),  # not ASCII
+            (wep, "abcde", True),
+            (wep, "0123456789", True),
+            (wep, "abcdefghijklm", True),  # 13
+            (wep, "0123456789abcdef0123456789", True),  # 26 hexadecimal
+            (wep, "abcdef", False),
+            (wep, "abcdefghijkl", False),  # 12
+            (wep, "abcdefghij", False),  # 10, not hexadecimal
+            (wep, "g" * 26, False),  # 26, not hexadecimal
+        ):
+            with self.subTest(security=network.security, password=password):
+                problem = monitor.passphrase_problem(network, password)
+                self.assertEqual(problem is None, fits, problem)
 
     def test_networks_strongest_first_each_once(self):
         class Listing:
@@ -213,13 +292,73 @@ class MonitorTest(unittest.TestCase):
                     "WPA2\tAES\t-70\tfar\n"
                     "WPA2\tAES\t-30\tnear\n"
                     "WPA2\tAES\t-50\tfar\n"
+                    "OPEN\tNONE\t-20\tfar\n"  # the same name, another network
+                    "WPA2\tAES\tloud\tbroken\n"
                     "broken line\n"
                 )
 
         self.assertEqual(
-            [(n.name, n.signal) for n in monitor.networks(Listing())],
-            [("near", -30), ("far", -50)],
+            [(n.name, n.open, n.signal) for n in monitor.networks(Listing())],
+            [("far", True, -20), ("near", False, -30), ("far", False, -50)],
         )
+
+    def test_names_that_are_not_utf_8_are_shown_and_sent_back_unchanged(self):
+        ssid = b"caf\xe9".decode(saneapi.TEXT_ENCODING, saneapi.TEXT_ERRORS)
+        network = monitor.Network(ssid, "WPA2", "AES", 0)
+        self.assertEqual(network.name, "caf\ufffd")
+        self.assertEqual(
+            network.ssid.encode(saneapi.TEXT_ENCODING, saneapi.TEXT_ERRORS),
+            b"caf\xe9",
+        )
+
+    def test_unexpected_failure_leaves_the_scanner_watched(self):
+        harness = Harness([PAPER])
+        failures = [RuntimeError("boom")]
+
+        def connect():
+            if failures:
+                raise failures.pop()
+            return harness.connect()
+
+        watcher = Monitor(connect, harness.scan, poll=0.005, retry=0.005)
+        with self.assertLogs("openscansnap.monitor", "ERROR"):
+            watcher.start()
+            self.addCleanup(watcher.stop, SECONDS)
+            self.wait_for(watcher, lambda s: s.state == State.UNUSABLE)
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+
+    def test_job_fails_when_watching_the_scanner_fails(self):
+        def connect():
+            raise RuntimeError("boom")
+
+        watcher = Monitor(connect, lambda name: None, poll=0.005, retry=0.005)
+        with self.assertLogs("openscansnap.monitor", "ERROR"):
+            watcher.start()
+            self.addCleanup(watcher.stop, SECONDS)
+            with self.assertRaises(sane.ScanError):
+                watcher.run_on_scanner(lambda d: "ran").result(SECONDS)
+
+    def test_job_that_fails_hands_its_failure_back(self):
+        watcher = self.watch(Harness([PAPER]))
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+
+        def fail(_device):
+            raise saneapi.SaneError(saneapi.IO_ERROR, "refused")
+
+        with self.assertRaisesRegex(saneapi.SaneError, "refused"):
+            watcher.run_on_scanner(fail).result(SECONDS)
+        self.assertEqual(watcher.run_on_scanner(lambda d: "ran").result(SECONDS), "ran")
+
+    def test_job_asked_for_during_a_scan_runs_after_it(self):
+        harness = Harness([PAPER])
+        harness.scan_gate.clear()
+        watcher = self.watch(harness)
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+        watcher.request_scan()
+        self.assertTrue(harness.scanning.wait(SECONDS))
+        future = watcher.run_on_scanner(lambda d: "ran")
+        harness.scan_gate.set()
+        self.assertEqual(future.result(SECONDS), "ran")
 
     def test_job_without_a_scanner_fails_plainly(self):
         watcher = self.watch(Harness(refuse=saneapi.SaneError(saneapi.IO_ERROR, "off")))
@@ -276,6 +415,83 @@ class MonitorTest(unittest.TestCase):
         done = self.wait_for(watcher, lambda s: s.message == "Every side was blank")
         self.assertEqual(done.making, 0)
 
+    def test_pdf_failure_stays_told_after_the_next_pdf(self):
+        harness = Harness(
+            [PAPER],
+            pdf_result=[
+                sane.ScanError("Cannot save"),
+                Path("second.pdf"),
+                Path("third.pdf"),
+            ],
+        )
+        harness.pdf_gate.clear()
+        watcher = self.watch(harness)
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+        watcher.request_scan()
+        self.wait_for(watcher, lambda s: s.making == 1)
+        watcher.request_scan()
+        self.wait_for(watcher, lambda s: s.making == 2)
+        with self.assertLogs("openscansnap.monitor", "WARNING"):
+            harness.pdf_gate.set()
+            done = self.wait_for(watcher, lambda s: s.making == 0)
+        self.assertEqual(done.failure, "Cannot save")
+        self.assertEqual(done.message, "Saved second.pdf")
+        watcher.request_scan()  # the next scan starts afresh
+        self.wait_for(watcher, lambda s: not s.failure)
+
+    def test_the_pdf_saved_last_is_told_and_outlives_a_failure(self):
+        harness = Harness(
+            [PAPER], pdf_result=[Path("first.pdf"), sane.ScanError("Cannot save")]
+        )
+        watcher = self.watch(harness)
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+        watcher.request_scan()
+        self.wait_for(watcher, lambda s: s.saved == Path("first.pdf") and s.making == 0)
+        with self.assertLogs("openscansnap.monitor", "WARNING"):
+            watcher.request_scan()
+            done = self.wait_for(
+                watcher, lambda s: s.failure == "Cannot save" and s.making == 0
+            )
+        self.assertEqual(done.saved, Path("first.pdf"))
+
+    def test_a_queued_pdf_hands_back_what_it_made(self):
+        watcher = self.watch(Harness([PAPER]))
+        made = watcher.queue_pdf(lambda progress: Path("again.pdf"))
+        self.assertEqual(made.result(SECONDS), Path("again.pdf"))
+        self.wait_for(watcher, lambda s: s.saved == Path("again.pdf") and s.making == 0)
+
+        def fail(progress):
+            raise sane.ScanError("Every page is left out")
+
+        with self.assertLogs("openscansnap.monitor", "WARNING"):
+            failed = watcher.queue_pdf(fail)
+            with self.assertRaisesRegex(sane.ScanError, "left out"):
+                failed.result(SECONDS)
+
+    def test_a_pdf_cancelled_while_waiting_is_skipped(self):
+        harness = Harness([PAPER])
+        harness.pdf_gate.clear()
+        watcher = self.watch(harness)
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+        watcher.request_scan()  # its PDF waits at the gate
+        self.wait_for(watcher, lambda s: s.making == 1)
+        cancelled = watcher.queue_pdf(lambda progress: Path("never.pdf"))
+        self.assertTrue(cancelled.cancel())
+        harness.pdf_gate.set()
+        after = watcher.queue_pdf(lambda progress: Path("after.pdf"))
+        self.assertEqual(after.result(SECONDS), Path("after.pdf"))  # thread alive
+        self.wait_for(watcher, lambda s: s.making == 0)
+
+    def test_the_sheet_being_made_is_told(self):
+        harness = Harness([PAPER])
+        harness.pdf_gate.clear()
+        watcher = self.watch(harness)
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+        watcher.request_scan()
+        self.wait_for(watcher, lambda s: s.progress == (1, 1))
+        harness.pdf_gate.set()
+        self.wait_for(watcher, lambda s: s.making == 0 and s.progress is None)
+
     def test_next_scan_does_not_wait_for_the_pdf(self):
         harness = Harness([PAPER])
         harness.pdf_gate.clear()  # the first PDF takes long
@@ -289,6 +505,29 @@ class MonitorTest(unittest.TestCase):
         harness.pdf_gate.set()
         done = self.wait_for(watcher, lambda s: s.making == 0)
         self.assertEqual(done.message, "Saved scan.pdf")
+
+    def test_a_scans_pdf_is_counted_before_its_scanning_ends(self):
+        # no snapshot between shows the app idle: the menu would offer to
+        # review the scan this one replaces
+        harness = Harness([PAPER])
+        harness.pdf_gate.clear()  # the PDF waits
+        seen = []
+        watcher = self.watch(harness)
+        set_snapshot = watcher._set
+
+        def recorded(**changes):
+            set_snapshot(**changes)
+            seen.append(watcher.snapshot)
+
+        watcher._set = recorded
+        self.wait_for(watcher, lambda s: s.state == State.PAPER)
+        watcher.request_scan()
+        self.wait_for(watcher, lambda s: s.making == 1 and s.state != State.SCANNING)
+        began = next(i for i, s in enumerate(seen) if s.state == State.SCANNING)
+        self.assertTrue(
+            all(s.state == State.SCANNING or s.making for s in seen[began:])
+        )
+        harness.pdf_gate.set()
 
     def test_unexpected_scan_failure_is_shown(self):
         harness = Harness([PAPER], scan_result=RuntimeError("boom"))
@@ -367,6 +606,7 @@ class ConnectorTest(unittest.TestCase):
         self.unreachable = set()  # hosts that do not answer
         self.refusing = set()  # hosts that answer, refusing us
         self.on_usb = False  # a scanner on USB
+        self.usb_status = saneapi.INVAL  # opening USB with none there; INVAL: none
 
         test = self
 
@@ -379,7 +619,7 @@ class ConnectorTest(unittest.TestCase):
                 if name == sane.USB_DEVICE:
                     self.opened.append(name)
                     if not test.on_usb:
-                        raise saneapi.SaneError(saneapi.INVAL, "no scanner on USB")
+                        raise saneapi.SaneError(test.usb_status, "no scanner on USB")
                     return name
                 host = name.removeprefix(sane.DEVICE_PREFIX)
                 self.opened.append(host)
@@ -407,6 +647,19 @@ class ConnectorTest(unittest.TestCase):
         patcher = mock.patch.object(sane, "configured", return_value=value)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_scanner_on_usb_that_cannot_be_used_is_not_passed_over(self):
+        self.configured(self.HERE)
+        for status in (saneapi.DEVICE_BUSY, saneapi.IO_ERROR):
+            with self.subTest(status=status):
+                self.usb_status = status
+                with self.assertRaises(saneapi.SaneError) as caught:
+                    self.wifi()
+                self.assertEqual(caught.exception.status, status)
+                opened = {name for library in self.libraries for name in library.opened}
+                self.assertEqual(opened, {sane.USB_DEVICE})  # no Wi-Fi scanner
+                scanner.set_up.assert_not_called()
+                scanner.follow.assert_not_called()
 
     def test_scanner_on_usb_comes_first(self):
         self.on_usb = True

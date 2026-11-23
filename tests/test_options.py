@@ -15,7 +15,7 @@ from openscansnap import config, pages, pdf
 from openscansnap.options import Quality, ScanMode
 from openscansnap.pages import Mode
 
-DEFAULTS = config.default_options()
+DEFAULTS = replace(config.default_options(), language="eng")  # pages.prepare: one
 
 
 class InEffectTest(unittest.TestCase):
@@ -48,6 +48,19 @@ class InEffectTest(unittest.TestCase):
         )
         self.assertTrue(raw.searchable)  # a text layer does not change the image
 
+    def test_text_turns_a_side_only_where_straightening_is_in_effect(self):
+        options = config.default_options()
+        expected = {
+            ScanMode.AUTO: True,
+            ScanMode.GRAY: True,
+            ScanMode.PHOTO: False,  # straightened by its paper alone
+            ScanMode.AS_SCANNED: False,  # kept whole
+        }
+        for mode, level in expected.items():
+            with self.subTest(mode=mode):
+                self.assertIs(replace(options, mode=mode).level_text, level)
+        self.assertFalse(replace(options, straighten=False).level_text)
+
     def test_choices_no_scan_can_have_are_refused(self):
         for changes in (
             {"mode": "fancy"},
@@ -55,6 +68,8 @@ class InEffectTest(unittest.TestCase):
             {"language": ""},
             {"language": "eng+"},
             {"language": "eng nld"},
+            {"language": "auto+eng"},  # Automatic, or languages: not both
+            {"language": "eng+auto"},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(DEFAULTS, **changes)
