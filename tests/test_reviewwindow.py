@@ -134,7 +134,7 @@ class ReviewWindowTest(Offscreen):
             self.window.previewCheck_(None)  # not made yet: still spinning
             self.assertIsNotNone(self.window.preview_timer)
             self.preview_gate.set()
-            self.window.previewing.result()
+            self.window.previewing.made.result()
             self.window.previewCheck_(None)
         self.assertEqual(self.preview.call_args.args, (self.scan, 1, ScanMode.GRAY))
         shown.assert_called_with(self.made)
@@ -149,7 +149,7 @@ class ReviewWindowTest(Offscreen):
         self.preview_gate.clear()
         self.select(0)
         self.choose(ScanMode.GRAY)
-        started = self.window.previewing
+        started = self.window.previewing.made
         self.select(2)  # another page, no change on it
         with mock.patch.object(self.window, "show_image") as shown:
             self.preview_gate.set()
@@ -167,27 +167,121 @@ class ReviewWindowTest(Offscreen):
         self.preview.assert_not_called()
         self.assertIn("left out", self.window.status.stringValue())
 
-    def test_an_update_shows_the_stored_page_and_its_own_status(self):
+    def test_the_change_stays_in_view_while_the_update_runs(self):
         self.preview_gate.clear()  # the preview is still being made
         self.select(0)
         self.choose(ScanMode.GRAY)
-        started = self.window.previewing
+        started = self.window.previewing.made
         with mock.patch.object(self.window, "show_image") as shown:
             self.window.updatePdf_(None)
+            self.assertIs(self.window.previewing.made, started)  # not dropped
             self.preview_gate.set()
-            started.result() if not started.cancelled() else None
+            started.result()
             self.window.previewCheck_(None)
-        shown.assert_called_once_with(self.scan.page(1))  # as stored, never made
+        shown.assert_called_once_with(self.made)  # the change, not the old page
         self.assertIsNone(self.window.previewing)
         self.assertEqual(self.window.status.stringValue(), "Updating the PDF…")
 
-    def test_a_failed_preview_says_why(self):
+    def test_a_changed_page_selected_during_an_update_shows_the_change(self):
+        self.select(0, 1)
+        self.choose(ScanMode.GRAY)  # previews the focus: row 1, side 2
+        self.window.previewing.made.result()
+        self.window.updatePdf_(None)
+        with mock.patch.object(self.window, "show_image") as shown:
+            self.select(0)  # side 1
+            self.assertIsNotNone(self.window.previewing)
+            self.window.previewing.made.result()
+            self.window.previewCheck_(None)
+            self.select(2)  # no change on it, and blank: shown as scanned
+        self.assertEqual(self.preview.call_count, 2)
+        self.assertEqual(self.preview.call_args.args, (self.scan, 1, ScanMode.GRAY))
+        self.assertEqual(
+            shown.call_args_list,
+            [mock.call(self.made), mock.call(self.scan.side_image(3))],
+        )
+        self.assertEqual(self.window.status.stringValue(), "Updating the PDF…")
+
+    def test_a_failed_update_keeps_its_error_over_a_late_preview(self):
+        failures = {
+            "No space left": sane.ScanError("No space left"),
+            "click Update PDF again": job.PdfSaved("review behind", Path("x.pdf")),
+        }
+        for said, failure in failures.items():
+            with self.subTest(said=said):
+                self.preview_gate.clear()  # the change's preview is still being made
+                self.select(0)
+                self.choose(ScanMode.GRAY)
+                started = self.window.previewing.made
+
+                def fail(scan, choices, progress, failure=failure):
+                    raise failure
+
+                self.update(fail)  # refused at once, the preview still being made
+                self.preview_gate.set()
+                started.result()
+                self.window.previewCheck_(None)
+                self.assertIn(said, self.window.status.stringValue())
+                self.assertEqual(self.window.pending, {1: "gray"})
+
+    def test_an_update_done_while_a_preview_is_made_shows_the_stored_page(self):
+        self.preview_gate.clear()
+        self.select(0)
+        self.choose(ScanMode.GRAY)
+        started = self.window.previewing.made
+        with mock.patch.object(self.window, "show_image") as shown:
+            self.update(lambda scan, choices, progress: scan.pdf)
+            self.preview_gate.set()
+            started.result() if not started.cancelled() else None
+            self.window.previewCheck_(None)
+        self.assertNotIn(mock.call(self.made), shown.call_args_list)
+        self.assertEqual(shown.call_args, mock.call(self.scan.page(1)))
+        self.assertIn("Updated", self.window.status.stringValue())
+        self.assertIsNone(self.window.preview_timer)
+
+    def test_a_failed_preview_says_why_and_shows_the_side_as_scanned(self):
+        self.preview.side_effect = OSError("disk full")
+        self.select(1)
+        self.choose(ScanMode.GRAY)
+        self.window.previewing.made.exception()
+        with mock.patch.object(self.window, "show_image") as shown:
+            self.window.previewCheck_(None)
+        shown.assert_called_once_with(self.scan.side_image(2))  # not another page's
+        self.assertIn("Could not show your change", self.window.status.stringValue())
+
+    def test_a_preview_failed_during_an_update_shows_the_side_as_scanned(self):
+        self.preview.side_effect = OSError("disk full")
+        self.select(0, 1)
+        self.choose(ScanMode.GRAY)
+        self.window.updatePdf_(None)
+        self.select(1)
+        self.window.previewing.made.exception()
+        with mock.patch.object(self.window, "show_image") as shown:
+            self.window.previewCheck_(None)
+        shown.assert_called_once_with(self.scan.side_image(2))
+        self.assertEqual(self.window.status.stringValue(), "Updating the PDF…")
+
+    def test_a_preview_is_dropped_when_nothing_is_selected(self):
         self.preview.side_effect = OSError("disk full")
         self.select(0)
         self.choose(ScanMode.GRAY)
-        self.window.previewing.exception()
-        self.window.previewCheck_(None)
-        self.assertIn("Could not show your change", self.window.status.stringValue())
+        made = self.window.previewing.made
+        self.window.table.deselectAll_(None)
+        self.assertIsNone(self.window.previewing)
+        made.exception() if not made.cancelled() else None
+        with mock.patch.object(self.window, "show_image") as shown:
+            self.window.previewCheck_(None)
+        shown.assert_not_called()  # least of all the last side, sides[-1]
+
+    def test_store_as_stays_off_after_a_failed_update_with_nothing_selected(self):
+        self.select(0)
+        self.choose(ScanMode.GRAY)
+        self.window.updatePdf_(None)
+        self.window.table.deselectAll_(None)
+        failed = sane.ScanError("No space left")  # no reload: busy alone decides
+        with mock.patch.object(self.store, "remake", side_effect=failed):
+            self.pdf_thread.run()
+        self.window.check_(None)
+        self.assertFalse(self.window.choice.isEnabled())
 
     def test_differing_choices_show_as_mixed(self):
         self.select(0)
@@ -386,6 +480,27 @@ class ReviewWindowTest(Offscreen):
         self.window.updatePdf_(None)  # the next update starts afresh
         self.window.check_(None)
         self.assertEqual(self.window.status.stringValue(), "Updating the PDF…")
+
+    def test_the_update_spinner_sits_in_the_page_column_beside_the_status(self):
+        # in the gutter, the spinner touched the list's selection border
+        status, spinner = self.window.status.frame(), self.window.spinner.frame()
+        page = self.window.preview.frame()
+        self.select(0)
+        self.choose(ScanMode.GRAY)
+        self.window.updatePdf_(None)
+        busy = self.window.status.frame()
+        self.assertEqual(spinner.origin.x, page.origin.x)
+        self.assertGreater(busy.origin.x, spinner.origin.x + spinner.size.width)
+        self.assertEqual(
+            busy.origin.x + busy.size.width, page.origin.x + page.size.width
+        )
+        with mock.patch.object(self.store, "remake", return_value=self.scan.pdf):
+            self.pdf_thread.run()
+        self.window.check_(None)
+        done = self.window.status.frame()
+        self.assertEqual(
+            (done.origin.x, done.size.width), (status.origin.x, status.size.width)
+        )
 
     def test_a_pdf_saved_without_its_review_keeps_the_changes(self):
         self.select(0)

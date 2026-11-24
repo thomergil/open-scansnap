@@ -103,7 +103,10 @@ class Scan:
 
 class Store:
     """The review folders under root. One writer at a time (the PDF
-    thread: keep and remake); hold and release may come from any thread.
+    thread: keep and remake), besides preview, which may run alongside a
+    remake of the same scan: it writes only its own file in the scan's
+    PREVIEWS folder, which a remake leaves alone. hold and release may come
+    from any thread.
     hold and prune take one lock, so prune never removes a scan that hold is
     opening for review."""
 

@@ -17,6 +17,7 @@ window any time.
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, replace
 
 import objc
 from AppKit import (
@@ -143,11 +144,24 @@ WIDTH, HEIGHT, MARGIN, GAP = 980.0, 720.0, 16.0, 10.0
 LIST_WIDTH, THUMB_WIDTH, ROW_HEIGHT = 290.0, 90.0, 112.0
 CONTROL_HEIGHT, BUTTON_WIDTH, BUTTON_HEIGHT = 26.0, 120.0, 30.0
 BOTTOM = 76.0  # the checkbox, its note and the buttons
-SPINNER = 16.0
+SPINNER = 16.0  # beside the status line while an update runs
+STATUS_INDENT = SPINNER + GAP / 2  # the status line's, past that spinner
+PREVIEW_LEFT = MARGIN + LIST_WIDTH + 2 * GAP  # the chosen page's column
 PREVIEW_SPINNER = 32.0  # over the page while a change is made into a preview
 CHECK_SECONDS = (
     0.2  # how often the window checks on a PDF update or a preview being made
 )
+
+
+@dataclass(frozen=True)
+class Preview:
+    """A changed side's page being made for the window (review.Store.preview)."""
+
+    side: int  # its number
+    made: Future  # the page's file, once made
+    # whether it writes the status line when done: it began with no update
+    # running, and none has begun since
+    reports: bool
 
 
 class ReviewWindow(NSObject):
@@ -169,7 +183,7 @@ class ReviewWindow(NSObject):
         self.progress: tuple[int, int] | None = None  # the update's: sheet, of sheets
         # pages made as a changed choice would store them, one at a time
         self.previews = ThreadPoolExecutor(1, thread_name_prefix="preview")
-        self.previewing: Future | None = None  # the page shown, as changed
+        self.previewing: Preview | None = None  # for the side shown
         self.preview_timer = None
         self.timer = None
         self.window = self.make_window()
@@ -228,7 +242,7 @@ class ReviewWindow(NSObject):
         scroller.setAutoresizingMask_(NSViewHeightSizable)
 
         # the chosen page, on the right
-        left = MARGIN + LIST_WIDTH + 2 * GAP
+        left = PREVIEW_LEFT
         right = WIDTH - MARGIN - left
         y = top - CONTROL_HEIGHT
         self.heading = self.label("", left, y, right, bold=True)
@@ -270,7 +284,7 @@ class ReviewWindow(NSObject):
         self.status = self.label(TEXT["shown"], left, BOTTOM + GAP, right, small=True)
         self.status.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
         self.spinner = NSProgressIndicator.alloc().initWithFrame_(
-            NSMakeRect(left - SPINNER - 2, BOTTOM + GAP + 2, SPINNER, SPINNER)
+            NSMakeRect(left, BOTTOM + GAP + 2, SPINNER, SPINNER)
         )
         self.spinner.setStyle_(NSProgressIndicatorStyleSpinning)
         self.spinner.setDisplayedWhenStopped_(False)
@@ -499,6 +513,7 @@ class ReviewWindow(NSObject):
         rows = self.selected()
         if not rows:
             self.choice.setEnabled_(False)
+            self.drop_preview()
             return
         self.choice.setEnabled_(self.updating is None)
         values = {self.chosen(self.scan.sides[row]) for row in rows}
@@ -528,31 +543,30 @@ class ReviewWindow(NSObject):
 
     @objc.python_method
     def show_page(self, side: review.Side) -> None:
-        """The side in the preview: as the PDF has it, or, when its choice
-        was changed, as the change would store it (made in the background,
-        a spinner over the page meanwhile)."""
-        if self.previewing is not None:
-            self.previewing.cancel()  # not wanted now, if not begun
-        self.previewing = None
-        self.preview_spinner.stopAnimation_(None)
-        if side.number not in self.pending or self.updating is not None:
+        """Show the side as the PDF has it or, when its choice was changed,
+        as that choice would store it, also while an update stores the
+        change. A side changed to a mode is made on the preview thread, with
+        a spinner over the page until it is ready."""
+        self.drop_preview()
+        if side.number not in self.pending:
             self.show_image(
                 self.scan.page(side.number) or self.scan.side_image(side.number)
             )
-            if self.updating is None:
-                self.status.setStringValue_(TEXT["shown"])
+            self.show_status(TEXT["shown"])
             return
         pending = self.pending[side.number]  # None: back to the scan's mode
         choice = review.choice_of(pending or str(self.scan.options.mode))
         if choice == job.LEAVE_OUT:
             self.show_image(self.scan.side_image(side.number))
-            self.status.setStringValue_(TEXT["previewed_out"])
+            self.show_status(TEXT["previewed_out"])
             return
-        self.previewing = self.previews.submit(
-            self.store.preview, self.scan, side.number, choice
+        self.previewing = Preview(
+            side.number,
+            self.previews.submit(self.store.preview, self.scan, side.number, choice),
+            reports=self.updating is None,
         )
         self.preview_spinner.startAnimation_(None)
-        self.status.setStringValue_(TEXT["previewing"])
+        self.show_status(TEXT["previewing"])
         if self.preview_timer is None:
             self.preview_timer = (
                 NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -563,27 +577,43 @@ class ReviewWindow(NSObject):
                 self.preview_timer, NSRunLoopCommonModes
             )
 
+    @objc.python_method
+    def drop_preview(self) -> None:
+        """Forget the preview being made: it no longer shows or reports."""
+        if self.previewing is not None:
+            self.previewing.made.cancel()  # one begun finishes unseen
+        self.previewing = None
+        self.preview_spinner.stopAnimation_(None)
+
     def previewCheck_(self, _timer) -> None:
-        if self.previewing is not None and not self.previewing.done():
+        if self.previewing is not None and not self.previewing.made.done():
             return
         self.preview_timer.invalidate()
         self.preview_timer = None
         if self.previewing is None:  # another page shown since
             return
-        made, self.previewing = self.previewing, None
+        done, self.previewing = self.previewing, None
         self.preview_spinner.stopAnimation_(None)
-        if self.updating is not None:  # the update's status stays, and its page
-            return
-        if made.exception() is not None:
-            error = job.describe(made.exception())
-            self.status.setStringValue_(TEXT["preview_failed"].format(error=error))
-            return
-        self.show_image(made.result())
-        self.status.setStringValue_(TEXT["previewed"])
+        error = done.made.exception()
+        if error is not None:
+            self.show_image(self.scan.side_image(done.side))
+            report = TEXT["preview_failed"].format(error=job.describe(error))
+        else:
+            self.show_image(done.made.result())
+            report = TEXT["previewed"]
+        if done.reports:
+            self.status.setStringValue_(report)
 
     @objc.python_method
     def show_image(self, path) -> None:
         self.preview.setImage_(NSImage.alloc().initWithContentsOfFile_(str(path)))
+
+    @objc.python_method
+    def show_status(self, text: str) -> None:
+        """Show text in the status line below the preview, unless an update
+        runs: its status stays there."""
+        if self.updating is None:
+            self.status.setStringValue_(text)
 
     @objc.python_method
     def pages(self) -> int:
@@ -644,7 +674,7 @@ class ReviewWindow(NSObject):
             == job.LEAVE_OUT
             for side in self.scan.sides
         ):
-            self.status.setStringValue_(TEXT["all_left_out"])
+            self.show_status(TEXT["all_left_out"])
             return
         scan, store = self.scan, self.store
         self.progress = None  # this update's own, not another PDF's
@@ -657,8 +687,9 @@ class ReviewWindow(NSObject):
             return store.remake(scan, choices, told)
 
         self.updating = self.monitor.queue_pdf(remake)
+        if self.previewing is not None:  # the status line is the update's now
+            self.previewing = replace(self.previewing, reports=False)
         self.busy(True)
-        self.show_selection()  # the page as stored, not a preview, meanwhile
         self.status.setStringValue_(TEXT["updating"])
         self.timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             CHECK_SECONDS, self, "check:", None, True
@@ -703,7 +734,17 @@ class ReviewWindow(NSObject):
     @objc.python_method
     def busy(self, busy: bool) -> None:
         (self.spinner.startAnimation_ if busy else self.spinner.stopAnimation_)(None)
-        self.choice.setEnabled_(not busy)
+        indent = STATUS_INDENT if busy else 0.0  # the text beside the spinner
+        line = self.status.frame()
+        self.status.setFrame_(
+            NSMakeRect(
+                PREVIEW_LEFT + indent,
+                line.origin.y,
+                self.preview.frame().size.width - indent,
+                line.size.height,
+            )
+        )
+        self.choice.setEnabled_(not busy and bool(self.selected()))
         self.update.setEnabled_(not busy and self.has_changes())
 
     # --- closing
@@ -728,10 +769,7 @@ class ReviewWindow(NSObject):
         return alert.runModal() == NSAlertSecondButtonReturn
 
     def windowWillClose_(self, _notification) -> None:
-        if self.previewing is not None:
-            self.previewing.cancel()  # one begun finishes unseen
-            self.previewing = None
-        self.preview_spinner.stopAnimation_(None)
+        self.drop_preview()
         self.closed = True
         self.pending = {}
         if self.scan is not None and self.updating is None:
