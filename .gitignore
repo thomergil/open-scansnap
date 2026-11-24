@@ -10,3 +10,6 @@ dist/
 
 # Private sample scans for the regression test (tests/test_samples.py)
 samples/
+
+# Local agent sandbox settings
+.safe_code.json
