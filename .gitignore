@@ -13,3 +13,6 @@ samples/
 
 # Local agent sandbox settings
 .safe_code.json
+
+# Release steps: they name private files on the owner's Mac
+RELEASE.md
